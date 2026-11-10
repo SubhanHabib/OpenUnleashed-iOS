@@ -20,10 +20,27 @@ pub(crate) fn point_filter() -> bool {
     POINT_FILTER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static ANISOTROPY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// PORT-DEVIATION (opt-in enhancement): anisotropic filtering, `1` (off, the original's), `2`, `4`, `8` or
+/// `16`, for the 3D textures that have mip levels (they are also sampled trilinear). Read by `Renderer::new`,
+/// so call it before the renderer is made. No effect with point filtering (`set_point_filter`).
+pub fn set_anisotropy(n: u8) {
+    let n = match n { 0 | 1 => 1, 2 | 3 => 2, 4..=7 => 4, 8..=15 => 8, _ => 16 };
+    ANISOTROPY.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn anisotropy() -> u8 {
+    ANISOTROPY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 mod camera;
 mod front;
 mod gpu;
 mod prof;
+mod texpack;
+
+pub use texpack::{set_texture_dump, set_texture_enhance, set_texture_pack, texture_hash};
 
 pub use camera::Camera;
 pub use front::Renderer;

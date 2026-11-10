@@ -119,6 +119,21 @@ pub(crate) fn prepare(paths: GamePaths, make_loop: impl FnOnce(bool) -> Result<O
     tracing::info!(root = %paths.root.display(), "located original game data");
     // the Verok patch's `nfs5.ini` (dll 0x100022B0): `Filtering=0` is the renderer's, before it is made
     nfs_renderer::set_point_filter(!paths.nfs5_ini().filtering);
+    // PORT-DEVIATION (texture packs): `NFS_TEXTURE_PACK` (folders, `:`-separated) of `<hash>.png` replacements,
+    // `NFS_TEXTURE_DUMP` (a folder) to save every texture under that name, `NFS_TEXTURE_ENHANCE` to upscale
+    // the small ones 2× and `NFS_ANISO` (2–16) for anisotropic filtering; the iOS app sets them from its options
+    if let Some(dirs) = std::env::var_os("NFS_TEXTURE_PACK") {
+        nfs_renderer::set_texture_pack(&std::env::split_paths(&dirs).collect::<Vec<_>>());
+    }
+    if let Some(dir) = std::env::var_os("NFS_TEXTURE_DUMP") {
+        nfs_renderer::set_texture_dump(Some(dir.into()));
+    }
+    if std::env::var_os("NFS_TEXTURE_ENHANCE").is_some() {
+        nfs_renderer::set_texture_enhance(true);
+    }
+    if let Some(n) = std::env::var("NFS_ANISO").ok().and_then(|v| v.parse().ok()) {
+        nfs_renderer::set_anisotropy(n);
+    }
     let cli = cli::Cli::from_env();
     // the strings every `Registry::load` reads after `fe.txt` (0x4B6698); PLATFORM GLUE: the port's own `--flags` stay out
     nfs_formats::fetxt::set_command_line(cli.options.clone());

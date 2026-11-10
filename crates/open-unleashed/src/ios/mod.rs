@@ -131,7 +131,21 @@ impl Root {
         app.ini.no_movies = ini.no_movies || o.skip_movies;
         // read when the renderer is made: from the next start
         nfs_renderer::set_point_filter(!(ini.filtering && o.filtering));
+        Self::apply_textures(&o);
         tracing::info!(?o, "options applied");
+    }
+
+    /// The texture options, read as textures load: they take hold for what loads after (in full, from the next start).
+    fn apply_textures(o: &settings::GameOptions) {
+        let Some(dir) = nfs_assets::platform::documents_dir().map(|d| d.join("Textures")) else { return };
+        if std::fs::create_dir_all(&dir).is_ok() && !dir.join("README.txt").exists() {
+            let _ = std::fs::write(dir.join("README.txt"), TEXTURES_README);
+        }
+        let packs = if o.texture_packs { vec![dir.clone()] } else { Vec::new() };
+        nfs_renderer::set_texture_pack(&packs);
+        nfs_renderer::set_texture_dump(o.dump_textures.then(|| dir.join("_dump")));
+        nfs_renderer::set_texture_enhance(o.enhance_textures);
+        nfs_renderer::set_anisotropy(if o.anisotropic { 16 } else { 1 });
     }
 
     /// `event_loop.exit()` (the front end's quit) does not end an iOS app; the process is ended here instead,
@@ -284,3 +298,19 @@ fn safe_insets(w: &winit::window::Window) -> [f32; 4] {
     let b = (os.height as f64 - is.height as f64) / s - t;
     [l, t, r, b].map(|v| v.max(0.0) as f32)
 }
+
+/// Written to `Documents/Textures` the first time it is made.
+const TEXTURES_README: &str = "Open Unleashed texture packs
+
+Put a pack here as a folder of PNG files. Each file replaces one of the game's textures and is
+named after it: 16 hex digits and .png, for example 3f2a9c0d11e4b7a5.png. The file can be any
+size (up to 8192 pixels a side); bigger is sharper. Folders inside a pack are read too. When two
+packs replace the same texture, the one whose folder name sorts first wins.
+
+To find a texture's name, turn on \"Save the game's textures\" in the settings page, play, and
+look in Textures/_dump: every texture the game loads is saved there under its name. Copy the ones
+you want to change into a pack folder and edit them. Folders whose name starts with _ (like
+_dump) are never read as packs.
+
+Packs and the texture options take hold from the next start of the app.
+";

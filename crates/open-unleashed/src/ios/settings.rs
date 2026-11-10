@@ -164,11 +164,25 @@ pub struct GameOptions {
     pub skip_movies: bool,
     /// Car-to-car collisions (`NFS_NO_CARCOL` when off).
     pub car_collisions: bool,
+    /// Replacement textures from `Documents/Textures` (`nfs_renderer::set_texture_pack`); from the next start.
+    pub texture_packs: bool,
+    /// Small textures without a replacement are upscaled 2× as they load (`nfs_renderer::set_texture_enhance`).
+    pub enhance_textures: bool,
+    /// 16× anisotropic filtering of the mipmapped textures (`nfs_renderer::set_anisotropy`).
+    pub anisotropic: bool,
+    /// The game's textures are saved to `Documents/Textures/_dump` as they load (`nfs_renderer::set_texture_dump`).
+    pub dump_textures: bool,
 }
 
 impl GameOptions {
     pub const DEFAULT: Self =
-        Self { safe_hud: true, resolution: 1.0, fps_cap: 0, fog: true, filtering: true, skip_movies: false, car_collisions: true };
+        Self { safe_hud: true, resolution: 1.0, fps_cap: 0, fog: true, filtering: true, skip_movies: false,
+        car_collisions: true,
+        texture_packs: true,
+        enhance_textures: false,
+        anisotropic: false,
+        dump_textures: false,
+    };
 
     fn parse(text: &str) -> Self {
         let mut o = Self::DEFAULT;
@@ -188,6 +202,10 @@ impl GameOptions {
                 "filtering" => o.filtering = on,
                 "skip_movies" => o.skip_movies = on,
                 "car_collisions" => o.car_collisions = on,
+                "texture_packs" => o.texture_packs = on,
+                "enhance_textures" => o.enhance_textures = on,
+                "anisotropic" => o.anisotropic = on,
+                "dump_textures" => o.dump_textures = on,
                 _ => {}
             }
         }
@@ -196,14 +214,19 @@ impl GameOptions {
 
     fn text(&self) -> String {
         format!(
-            "safe_hud={}\nresolution={:.2}\nfps_cap={}\nfog={}\nfiltering={}\nskip_movies={}\ncar_collisions={}\n",
+            "safe_hud={}\nresolution={:.2}\nfps_cap={}\nfog={}\nfiltering={}\nskip_movies={}\ncar_collisions={}\n\
+             texture_packs={}\nenhance_textures={}\nanisotropic={}\ndump_textures={}\n",
             self.safe_hud as u8,
             self.resolution,
             self.fps_cap,
             self.fog as u8,
             self.filtering as u8,
             self.skip_movies as u8,
-            self.car_collisions as u8
+            self.car_collisions as u8,
+            self.texture_packs as u8,
+            self.enhance_textures as u8,
+            self.anisotropic as u8,
+            self.dump_textures as u8
         )
     }
 }
@@ -460,6 +483,10 @@ struct Controls {
     filtering: Retained<UISwitch>,
     skip_movies: Retained<UISwitch>,
     car_collisions: Retained<UISwitch>,
+    texture_packs: Retained<UISwitch>,
+    enhance_textures: Retained<UISwitch>,
+    anisotropic: Retained<UISwitch>,
+    dump_textures: Retained<UISwitch>,
 }
 
 pub struct Ivars {
@@ -515,6 +542,10 @@ impl Page {
             filtering: c.filtering.isOn(),
             skip_movies: c.skip_movies.isOn(),
             car_collisions: c.car_collisions.isOn(),
+            texture_packs: c.texture_packs.isOn(),
+            enhance_textures: c.enhance_textures.isOn(),
+            anisotropic: c.anisotropic.isOn(),
+            dump_textures: c.dump_textures.isOn(),
         };
         let s = TouchSettings {
             steering: STEERING.get(pick(&c.steering)).map_or(Steering::Stick, |s| s.1),
@@ -651,6 +682,17 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let game_h = label(mtm, "Game", UIFont::boldSystemFontOfSize(21.0), 1.0);
     let (movies_row, skip_movies) = switch_row(mtm, page, "Skip the intro movies", o.skip_movies);
     let (col_row, car_collisions) = switch_row(mtm, page, "Car-to-car collisions", o.car_collisions);
+    let tex_h = label(mtm, "Textures (from the next start)", UIFont::boldSystemFontOfSize(21.0), 1.0);
+    let (packs_row, texture_packs) = switch_row(mtm, page, "Texture packs (Files › Open Unleashed › Textures)", o.texture_packs);
+    let (enhance_row, enhance_textures) = switch_row(mtm, page, "Enhanced textures (2× upscale, experimental)", o.enhance_textures);
+    let (aniso_row, anisotropic) = switch_row(mtm, page, "Sharper road at a distance (anisotropic filtering)", o.anisotropic);
+    let (dump_row, dump_textures) = switch_row(mtm, page, "Save the game's textures to Textures/_dump (for pack makers)", o.dump_textures);
+    let tex_note = label(
+        mtm,
+        "A pack is a folder in Textures holding PNG files named after the texture they replace (the names Textures/_dump uses), at any size. Folders whose name starts with _ are skipped.",
+        UIFont::systemFontOfSize(13.0),
+        0.6,
+    );
     let ini_note = label(
         mtm,
         "Fog, smooth textures and the intro movies follow the game folder's nfs5.ini too: an option turned off there stays off.",
@@ -665,10 +707,10 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     // SAFETY: as in `segments`
     unsafe { done.addTarget_action_forControlEvents(Some(page), sel!(done:), UIControlEvents::TouchUpInside) };
 
-    let views: [&UIView; 27] = [
+    let views: [&UIView; 33] = [
         &title, &touch_h, &note, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
         &legend, &display_h, &resolution_l, &resolution, &frame_rate_l, &frame_rate, &safe_row, &fog_row, &filter_row, &game_h,
-        &movies_row, &col_row, &ini_note, &done,
+        &movies_row, &col_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &ini_note, &done,
     ];
     let content = stack(mtm, &views, UILayoutConstraintAxis::Vertical, 12.0);
     content.setAlignment(UIStackViewAlignment::Fill);
@@ -680,6 +722,8 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     content.setCustomSpacing_afterView(20.0, &title);
     content.setCustomSpacing_afterView(20.0, &frame_rate);
     content.setCustomSpacing_afterView(32.0, &filter_row);
+    content.setCustomSpacing_afterView(32.0, &col_row);
+    content.setCustomSpacing_afterView(20.0, &tex_note);
     content.setCustomSpacing_afterView(24.0, &ini_note);
     content.setTranslatesAutoresizingMaskIntoConstraints(false);
     title.setTextAlignment(NSTextAlignment::Center);
@@ -723,6 +767,10 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
         filtering,
         skip_movies,
         car_collisions,
+        texture_packs,
+        enhance_textures,
+        anisotropic,
+        dump_textures,
     }
 }
 
@@ -735,7 +783,13 @@ mod tests {
         let s = TouchSettings { steering: Steering::Tilt, pedals: Pedals::Buttons, xy: false, shoulders: true, right_stick: true, tilt_sensitivity: 1.5 };
         assert_eq!(TouchSettings::parse(&s.text()), s);
         assert_eq!(TouchSettings::parse(""), TouchSettings::DEFAULT);
-        let o = GameOptions { safe_hud: false, resolution: 0.75, fps_cap: 30, fog: false, filtering: false, skip_movies: true, car_collisions: false };
+        let o = GameOptions { safe_hud: false, resolution: 0.75, fps_cap: 30, fog: false, filtering: false, skip_movies: true,
+            car_collisions: false,
+            texture_packs: false,
+            enhance_textures: true,
+            anisotropic: true,
+            dump_textures: true,
+        };
         assert_eq!(GameOptions::parse(&o.text()), o);
         assert_eq!(GameOptions::parse("resolution=0.3\nfps_cap=45"), GameOptions::DEFAULT);
     }

@@ -141,7 +141,13 @@ struct GpuTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     sprite_bg: Option<wgpu::BindGroup>,
+    /// A replacement texture (`texpack`): the original's `(width, height, levels)`, and the
+    /// replacement's own `(width, height, levels)` the GPU texture has
+    replaced: Option<(TexShape, TexShape)>,
 }
+
+/// A texture's `(width, height, levels)`.
+type TexShape = (u32, u32, usize);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -223,6 +229,8 @@ pub(crate) struct Core {
     /// the `FakeSort` single-draw arm's samplers (Thrash 7 ← 0, `MAG`/`MINFILTER` `POINT`), by
     /// address mode alone — index `clamp_u | clamp_v << 1` — used only for a single-draw item
     point_samplers: [wgpu::Sampler; 4],
+    /// PORT-DEVIATION (opt-in, `set_anisotropy`): trilinear and anisotropic, for textures with mip levels
+    aniso_samplers: Option<[wgpu::Sampler; 4]>,
     /// the mip filter's `POINT` → `LINEAR` promotion, `[0x69DD1D]` (`set_trilinear`); clear at start, as the image has it
     trilinear: bool,
     /// `LayerFalseSort1`/`2`'s per-frame pick, [`FakeSortMode`] — `main.rs` sets it from
@@ -880,6 +888,26 @@ impl Core {
         // default as every other sampler below `SPECIALFX` 3 (`trilinear` is false whenever
         // `fakesort_mode` can pick `Single`/`PerItem` — both are set from the same level, `main.rs`)
         let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest));
+        // PORT-DEVIATION (opt-in enhancement): the original asks for no anisotropy (above); `set_anisotropy`
+        // gives the textures that have mip levels trilinear, anisotropic sampling. Single-level textures
+        // keep the plain samplers (an anisotropic sampler over one level is the Metal fault F2 below).
+        let aniso = crate::anisotropy();
+        let aniso_samplers = (aniso > 1 && !crate::point_filter()).then(|| {
+            std::array::from_fn(|i: usize| {
+                let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
+                device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("scene anisotropic"),
+                    address_mode_u: mode(i & 1 != 0),
+                    address_mode_v: mode(i & 2 != 0),
+                    address_mode_w: wgpu::AddressMode::Repeat,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                    anisotropy_clamp: u16::from(aniso),
+                    ..Default::default()
+                })
+            })
+        });
 
         // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
         // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
@@ -971,6 +999,7 @@ impl Core {
             buffer_serial: 0,
             samplers,
             point_samplers,
+            aniso_samplers,
             trilinear: false,
             fakesort_mode: FakeSortMode::default(),
             gamma: 1.0,
@@ -1353,6 +1382,14 @@ impl Core {
     }
 
     fn make_texture(device: &wgpu::Device, queue: &wgpu::Queue, sprite_layout: &wgpu::BindGroupLayout, sprite_sampler: &wgpu::Sampler, width: u32, height: u32, mips: &[Vec<u8>]) -> GpuTexture {
+        // PORT-DEVIATION (opt-in enhancement): texture packs, the dump and the on-device enhancer (`texpack`)
+        let replacement = crate::texpack::active().then(|| mips.first().and_then(|l0| crate::texpack::replace(width, height, mips.len(), l0, true))).flatten();
+        let orig = (width, height, mips.len());
+        let (width, height, mips) = match &replacement {
+            Some(r) => (r.width, r.height, r.mips.as_slice()),
+            None => (width, height, mips),
+        };
+        let replaced = replacement.as_ref().map(|_| (orig, (width, height, mips.len())));
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
         let mip_level_count = mips.len().max(1) as u32;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1383,16 +1420,34 @@ impl Core {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sprite_sampler) }],
         }));
         tracing::debug!(w = width, h = height, "texture uploaded");
-        GpuTexture { _texture: texture, view, sprite_bg }
+        GpuTexture { _texture: texture, view, sprite_bg, replaced }
     }
 
 
     /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
     /// rest is ignored; less and the level is skipped).
     pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
-        if self.textures.get(id.0 as usize).is_none() {
+        let Some(tex) = self.textures.get(id.0 as usize) else { return };
+        // a replaced texture (`texpack`) takes the new pixels replaced again, or scaled up to its size, its
+        // levels rebuilt from the new top level (the original's lower levels are not used)
+        if let Some(((ow, oh, olevels), (rw, rh, rlevels))) = tex.replaced {
+            if level != 0 || (w, h) != (ow, oh) || data.len() < 4 * w as usize * h as usize {
+                return;
+            }
+            let r = crate::texpack::replace(w, h, olevels, data, false)
+                .filter(|r| (r.width, r.height) == (rw, rh) && r.mips.len() == rlevels)
+                .unwrap_or_else(|| crate::texpack::resized(w, h, data, rw, rh, rlevels));
+            let (mut lw, mut lh) = (rw, rh);
+            for (l, m) in r.mips.iter().enumerate() {
+                self.queue_texture_level_raw(id, l as u32, lw, lh, m);
+                (lw, lh) = ((lw / 2).max(1), (lh / 2).max(1));
+            }
             return;
         }
+        self.queue_texture_level_raw(id, level, w, h, data);
+    }
+
+    fn queue_texture_level_raw(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
         // queued for the next frame's encoder (`flush_texture_writes`), where `write_texture` would
         // have executed it (before that submit's commands); the rows are padded to 256 bytes
         let row = 4 * w as usize;
@@ -1582,7 +1637,11 @@ impl Core {
     /// A material's bind group: its texture, the sampler for its address modes under the current
     /// mip filter, and the environment map.
     fn material_bind_group(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
-        let sampler = &self.samplers[sampler | (!self.trilinear as usize) << 2];
+        let mipped = self.textures.get(texture.0 as usize).is_some_and(|t| t._texture.mip_level_count() > 1);
+        let sampler = match &self.aniso_samplers {
+            Some(a) if mipped => &a[sampler & 3],
+            _ => &self.samplers[sampler | (!self.trilinear as usize) << 2],
+        };
         self.material_bind_group_with(texture, sampler, env)
     }
 
@@ -1719,7 +1778,7 @@ impl Core {
                     layout: &self.sprite_layout,
                     entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
                 }));
-                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg });
+                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, replaced: None });
                 let id = TextureId(self.textures.len() as u32 - 1);
                 self.offscreen.insert(id.0, (width, height));
                 id

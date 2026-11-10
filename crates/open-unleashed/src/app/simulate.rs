@@ -1853,7 +1853,7 @@ impl App {
         // car's entry into the list `0x628CDC[]`: with `COMMSPOSITIONAL && NOCOLLISION` no car
         // meets another (each car's walls 0x495020 and props 0x498DE0 run before the gate);
         // `NFS_NO_CARCOL` is the port's own diagnostic switch for the same skip
-        let no_carcol = self.net_launch.nocollision || nfs_game::config::cfg().nfs_no_carcol.is_set();
+        let no_carcol = self.net_launch.nocollision || self.no_carcol;
         // `car+0x354`, the collision mass: `HEAVY` `[0x6573FC]` (the fetherw8 code, cheat bit 8)
         // multiplies a human car's by 12 (0x49B5FB…0x49B613, `[0x5B240C]`)
         // …and otherwise `.TINYCAR` divides any car's by 12 (0x49B615…0x49B62F, `[0x5B49B0]`) —

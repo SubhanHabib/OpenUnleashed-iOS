@@ -623,7 +623,55 @@ impl App {
             return t;
         }
         let (w, h) = self.renderer.as_ref().map_or((640, 480), |r| r.size());
-        (w, h, self.window_scale())
+        (w, h, self.window_scale() * self.render_scale)
+    }
+
+    /// **PLATFORM GLUE (iOS)**: the rectangle of the logical screen the race HUD is laid out in,
+    /// `(left, top, width, height)`: the screen less [`App::hud_inset`] (the camera cutout and the home
+    /// indicator), in a race only. `None`: the whole screen (no insets, a still, the front end).
+    pub(crate) fn hud_safe(&self, lw: u32, lh: u32) -> Option<(u32, u32, u32, u32)> {
+        if self.vehicle.is_none() || self.shot_target.is_some() {
+            return None;
+        }
+        let [l, t, r, b] = self.hud_inset.map(|v| v.max(0.0).round() as u32);
+        let (w, h) = (lw.saturating_sub(l + r), lh.saturating_sub(t + b));
+        (l + t + r + b > 0 && w >= 320 && h >= 200).then_some((l, t, w, h))
+    }
+
+    /// The HUD's sprites laid out on the safe rectangle `(l, t, w, h)` ([`App::hud_safe`]) moved to where that
+    /// rectangle lies on the whole `lw × lh` screen. A sprite's place is a fraction of the screen and its size a
+    /// fraction of the screen's height ([`nfs_renderer::Sprite`]).
+    fn shift_hud(sprites: &mut [nfs_renderer::Sprite], (lw, lh): (u32, u32), (l, t, w, h): (u32, u32, u32, u32)) {
+        let (lw, lh) = (lw as f32, lh as f32);
+        let (l, t, w, h) = (l as f32, t as f32, w as f32, h as f32);
+        let at = |p: [f32; 2]| [(l + p[0] * w) / lw, (t + p[1] * h) / lh];
+        for s in sprites {
+            s.pos = at(s.pos);
+            s.size = [s.size[0] * h / lh, s.size[1] * h / lh];
+            if let Some((pts, _)) = s.tri.as_mut() {
+                for p in pts.iter_mut() {
+                    *p = at(*p);
+                }
+            }
+        }
+    }
+
+    /// **PLATFORM GLUE**: the render target at [`App::render_scale`] of the window's pixels, and the dll's mode
+    /// cells to match (`camera::set_mode`).
+    pub(crate) fn apply_render_size(&mut self) {
+        #[cfg(target_os = "ios")]
+        let px = self.surface_px.or_else(|| self.window.as_ref().map(|w| (w.outer_size().width, w.outer_size().height)));
+        #[cfg(not(target_os = "ios"))]
+        let px = self.surface_px;
+        let Some((w, h)) = px else { return };
+        let s = self.render_scale.clamp(0.25, 1.0);
+        let (rw, rh) = (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1));
+        if let Some(r) = self.renderer.as_mut()
+            && r.size() != (rw, rh)
+        {
+            r.resize(rw, rh);
+        }
+        nfs_game::camera::set_mode(rw, rh);
     }
 
     /// The window's scale factor; while `start_race` has the window taken out of the `App` the last one seen
@@ -641,7 +689,7 @@ impl App {
     pub(crate) fn hud_logical_on(&self, r: &Renderer) -> (u32, u32) {
         let (w, h, s) = self.shot_target.unwrap_or_else(|| {
             let (w, h) = r.size();
-            (w, h, self.window_scale())
+            (w, h, self.window_scale() * self.render_scale)
         });
         (((w as f32 / s).round() as u32).max(1), ((h as f32 / s).round() as u32).max(1))
     }
@@ -657,8 +705,11 @@ impl App {
         // PORT-DEVIATION D46: the camera slot's camera and slice as its own last pass left them (see `photo.rs`)
         self.photo_frame_begin();
         let (lw, lh) = self.hud_logical();
-        Hud::set_screen(lw, lh);
-        self.hud_stored_sync(lw, lh); // N01a: an existing HUD record is used as stored
+        // PLATFORM GLUE (iOS): in a race the HUD is laid out on the safe area (`hud_safe`) and moved onto it below
+        let safe = self.hud_safe(lw, lh);
+        let (sw, sh) = safe.map_or((lw, lh), |s| (s.2, s.3));
+        Hud::set_screen(sw, sh);
+        self.hud_stored_sync(sw, sh); // N01a: an existing HUD record is used as stored
         self.fix_mission_result();
         // the port's own overlays lay their text out in screen units, so the fonts need to know
         // what shape the window is (the HUD and the front end place glyphs in 640×480 themselves)
@@ -872,6 +923,9 @@ impl App {
         }
         // PORT-DEVIATION D46: photo mode's hint, and the pointer to it on the pause menu / in a replay
         self.photo_hint();
+        if let Some(safe) = safe {
+            Self::shift_hud(&mut self.scene.sprites[hud_sprites_from..], (lw, lh), safe);
+        }
         // `+0x100` for the next release, and sound 9 when the pointer crosses into a button
         // (0x41B3BA…0x41B3C6)
         let hover = hud_hover.flatten();

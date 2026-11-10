@@ -122,6 +122,16 @@ impl LayoutScreen {
         })
     }
 
+    /// The focused input box's box in the 640 × 480 design space, `(x, y, w, h)`
+    /// ([`focused_input`](Self::focused_input)'s box, as the hit test takes it). PLATFORM GLUE: the iOS
+    /// keyboard keeps it in view.
+    pub fn focused_input_box(&self) -> Option<(f32, f32, f32, f32)> {
+        let e = self.layout.elements.get(self.focused_input()?)?;
+        let (x, y) = self.position_of(e);
+        let (w, h) = self.box_hit(e);
+        Some((x, y, w, h))
+    }
+
     /// One typed character, filtered exactly as the shared key handler **0x4CCC20** filters it:
     ///
     /// ```text

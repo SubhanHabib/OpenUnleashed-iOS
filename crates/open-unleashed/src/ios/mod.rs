@@ -93,9 +93,12 @@ impl Root {
                 // the game makes its own window; the import screen's goes
                 drop(imp);
                 el.set_control_flow(ControlFlow::Poll);
+                // the options the renderer is made with (filtering) and the start-up reads (the intro movies)
+                Self::apply_options(&mut app);
                 app.resumed(el);
+                app.apply_render_size();
                 if let Some(w) = app.intro.as_ref().map(|r| &r.window).or(app.window.as_ref()) {
-                    tracing::info!(inner = ?w.inner_size(), outer = ?w.outer_size(), scale = w.scale_factor(), "game window");
+                    tracing::info!(inner = ?w.inner_size(), outer = ?w.outer_size(), scale = w.scale_factor(), insets = ?safe_insets(w), "game window");
                 }
                 self.state = State::Game(Box::new(app));
             }
@@ -113,6 +116,22 @@ impl Root {
                 self.import_state(el, imp);
             }
         }
+    }
+
+    /// The settings page's display and game options, onto the game ([`settings::GameOptions`]). The `nfs5.ini`
+    /// ones combine with the file's: an option the file turns off stays off.
+    fn apply_options(app: &mut App) {
+        let o = settings::options();
+        let ini = app.paths.nfs5_ini();
+        app.render_scale = o.resolution;
+        app.apply_render_size();
+        app.fps_cap = (o.fps_cap > 0).then_some(o.fps_cap as f64);
+        app.no_carcol = !o.car_collisions;
+        app.ini.fog = ini.fog && o.fog;
+        app.ini.no_movies = ini.no_movies || o.skip_movies;
+        // read when the renderer is made: from the next start
+        nfs_renderer::set_point_filter(!(ini.filtering && o.filtering));
+        tracing::info!(?o, "options applied");
     }
 
     /// `event_loop.exit()` (the front end's quit) does not end an iOS app; the process is ended here instead,
@@ -212,6 +231,14 @@ impl ApplicationHandler for Root {
                 if settings::take_changed() {
                     self.pad.rebuild();
                 }
+                if settings::take_options_changed() {
+                    Self::apply_options(app);
+                }
+                // the race HUD keeps clear of the camera cutout and the home indicator (`App::hud_safe`)
+                app.hud_inset = match app.window.as_ref() {
+                    Some(w) if settings::options().safe_hud => safe_insets(w),
+                    _ => [0.0; 4],
+                };
                 self.pad.update(app);
                 self.tilt.update(self.pad.connected() && settings::current().steering == settings::Steering::Tilt);
                 if self.touch.take_pressed() {
@@ -243,4 +270,17 @@ impl ApplicationHandler for Root {
     fn memory_warning(&mut self, _el: &ActiveEventLoop) {
         tracing::warn!("iOS memory warning");
     }
+}
+
+/// The safe area's insets in logical pixels, `[left, top, right, bottom]`: winit's inner rectangle is the safe area
+/// within the whole view (the outer one).
+fn safe_insets(w: &winit::window::Window) -> [f32; 4] {
+    let s = w.scale_factor();
+    let (Ok(i), Ok(o)) = (w.inner_position(), w.outer_position()) else { return [0.0; 4] };
+    let (is, os) = (w.inner_size(), w.outer_size());
+    let l = (i.x - o.x) as f64 / s;
+    let t = (i.y - o.y) as f64 / s;
+    let r = (os.width as f64 - is.width as f64) / s - l;
+    let b = (os.height as f64 - is.height as f64) / s - t;
+    [l, t, r, b].map(|v| v.max(0.0) as f32)
 }

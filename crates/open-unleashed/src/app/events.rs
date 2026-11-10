@@ -580,11 +580,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(size) => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.resize(size.width, size.height);
-                }
-                // a new mode: the dll's SetMode cells (`camera::set_mode`)
-                nfs_game::camera::set_mode(size.width, size.height);
+                // a new mode: the render target (at `render_scale`, PLATFORM GLUE) and the dll's SetMode cells
+                // (`camera::set_mode`)
+                self.surface_px = Some((size.width, size.height));
+                self.apply_render_size();
             }
             // The pointer, mapped back through `place`: the design area keeps 4:3 and is centred
             // in a wider window, so the inverse is `(u - x0) / fw * 640` across and `v * 480` down.
@@ -595,7 +594,10 @@ impl ApplicationHandler for App {
                 let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
                 self.fe.cursor = if race_hud {
                     let (ox, oy) = Hud::origin();
-                    Some(((position.x / scale) as f32 - ox, (position.y / scale) as f32 - oy))
+                    // PLATFORM GLUE (iOS): the HUD laid out on the safe area (`App::hud_safe`)
+                    let (lw, lh) = self.hud_logical();
+                    let (sx, sy) = self.hud_safe(lw, lh).map_or((0.0, 0.0), |s| (s.0 as f32, s.1 as f32));
+                    Some(((position.x / scale) as f32 - ox - sx, (position.y / scale) as f32 - oy - sy))
                 } else { self.window.as_ref().map(|w| {
                     // PLATFORM GLUE (iOS): winit's `inner_size` there is the safe area, while the game draws
                     // over the whole view (the size `Resized` gives) and touches are in the whole view's pixels

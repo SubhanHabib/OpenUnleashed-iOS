@@ -219,6 +219,18 @@ pub(crate) struct App {
     /// the window's last seen scale factor ([`App::hud_geometry`]): `start_race` takes the renderer AND the window
     /// out of the `App` for the whole load, and the loading screen drawn meanwhile needs both (LOADSEAM)
     pub(crate) hud_scale: std::cell::Cell<f32>,
+    /// PLATFORM GLUE (iOS): the safe area's insets in logical pixels `[left, top, right, bottom]` (the camera
+    /// cutout, the home indicator): the race HUD is laid out inside them ([`App::hud_safe`]); zero elsewhere
+    pub(crate) hud_inset: [f32; 4],
+    /// PLATFORM GLUE: the render target's size as a fraction of the window's pixels (iOS's Resolution option;
+    /// 1 elsewhere). The HUD's logical resolution stays the window's ([`App::hud_geometry`]).
+    pub(crate) render_scale: f32,
+    /// the window's own pixel size, as the last `Resized` gave it ([`App::apply_render_size`])
+    pub(crate) surface_px: Option<(u32, u32)>,
+    /// the frame cap in frames a second ([`App::pace_frame`]): `NFS_FPS_CAP` (D4), or iOS's Frame rate option
+    pub(crate) fps_cap: Option<f64>,
+    /// no car-to-car collisions: `NFS_NO_CARCOL`, or iOS's Car collisions option
+    pub(crate) no_carcol: bool,
     /// The race HUD's slide states of its element groups: `(state, [0x606AC8] stamp of the last transition)`
     pub(crate) slides: HudSlides,
     /// what the HUD toggle keys F5 / F6 / F7 / F8 / "2" change (`HudKeys`)

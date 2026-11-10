@@ -13,8 +13,9 @@
 use crate::*;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::msg_send;
+use objc2::{Encode, Encoding, msg_send};
 use objc2_foundation::{NSArray, NSError, NSSet, NSString};
+use objc2_ui_kit::UIView;
 use std::collections::{HashSet, VecDeque};
 use winit::dpi::PhysicalPosition;
 use winit::event::{Touch as WinitTouch, TouchPhase};
@@ -241,6 +242,8 @@ pub struct Keyboard {
     shown: bool,
     /// Put away by Return while the field still wants text.
     dismissed: bool,
+    /// How far the game's view is moved up, in points ([`Keyboard::keep_in_view`]).
+    lift: f64,
 }
 
 impl Keyboard {
@@ -253,6 +256,25 @@ impl Keyboard {
         if want != self.shown {
             self.set(app, want);
         }
+        self.keep_in_view(app);
+    }
+
+    /// The keyboard covers the lower part of the screen (more than half of an iPhone's, in landscape): while it is
+    /// up, the game's view moves up just far enough that the box being typed in sits above it. UIKit takes the move
+    /// into account for the touches, so the game sees them where they were.
+    fn keep_in_view(&mut self, app: &App) {
+        let Some(view) = app.window.as_ref().and_then(|w| ui_view(w)) else { return };
+        let lift = if self.shown { field_lift(app, &view).unwrap_or(0.0) } else { 0.0 };
+        if (lift - self.lift).abs() < 0.5 {
+            return;
+        }
+        self.lift = lift;
+        let t = CGAffineTransform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: -lift };
+        // SAFETY: `-[UIView setTransform:]` on winit's view, on the main thread
+        unsafe {
+            let _: () = msg_send![&*view, setTransform: t];
+        }
+        tracing::info!(lift, "game view moved over the keyboard");
     }
 
     fn set(&mut self, app: &App, shown: bool) {
@@ -287,6 +309,86 @@ impl Keyboard {
             self.set(app, true);
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct CGAffineTransform {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    tx: f64,
+    ty: f64,
+}
+
+// SAFETY: CoreGraphics' structs of `CGFloat`s (`double` on every 64-bit iOS)
+unsafe impl Encode for CGPoint {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl Encode for CGSize {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl Encode for CGRect {
+    const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
+}
+unsafe impl Encode for CGAffineTransform {
+    const ENCODING: Encoding = Encoding::Struct("CGAffineTransform", &[f64::ENCODING; 6]);
+}
+
+/// winit's view of the window.
+fn ui_view(window: &winit::window::Window) -> Option<Retained<UIView>> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let RawWindowHandle::UiKit(h) = window.window_handle().ok()?.as_raw() else { return None };
+    // SAFETY: winit's live `UIView`, retained for our use
+    unsafe { Retained::retain(h.ui_view.as_ptr().cast::<UIView>()) }
+}
+
+/// How far the view has to move up so that the box being typed in clears the keyboard, in points; `None`: no
+/// keyboard on the screen (a hardware keyboard), or nothing to keep in view.
+fn field_lift(app: &App, view: &UIView) -> Option<f64> {
+    let window = view.window()?;
+    // SAFETY: `-[UIView keyboardLayoutGuide]` (iOS 15) and `-[UILayoutGuide layoutFrame]`, in the window's
+    // coordinates, which the view's own move does not change
+    let (kb, bounds): (CGRect, CGRect) = unsafe {
+        let guide: Retained<AnyObject> = msg_send![&*window, keyboardLayoutGuide];
+        (msg_send![&*guide, layoutFrame], msg_send![view, bounds])
+    };
+    // with no keyboard up, the guide is the bottom of the safe area
+    if kb.size.height < 80.0 {
+        return None;
+    }
+    let (vw, vh) = (bounds.size.width.max(1.0), bounds.size.height.max(1.0));
+    // the front end's 640 × 480 design space, pillarboxed (or letterboxed) into the view
+    let k = (vw / 640.0).min(vh / 480.0);
+    let y0 = (vh - 480.0 * k) * 0.5;
+    let bottom = match app.fe.layout_preview.as_ref().and_then(|l| l.focused_input_box()) {
+        Some((_, y, _, h)) if app.vehicle.is_none() && app.fe.dialog.is_none() => y0 + (y + h) as f64 * k,
+        // a dialog's field and the replay's name box sit about the middle of the screen
+        _ => vh * 0.5 + 30.0,
+    };
+    Some((bottom + 12.0 - kb.origin.y).clamp(0.0, kb.size.height))
 }
 
 /// The keyboard's Return and space come as the characters "\n" and " "; the fields read the named keys, as a

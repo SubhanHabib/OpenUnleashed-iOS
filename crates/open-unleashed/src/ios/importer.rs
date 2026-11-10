@@ -149,7 +149,7 @@ impl Importer {
 
         let controls = UIButton::buttonWithType(UIButtonType::System, mtm);
         let config = UIButtonConfiguration::grayButtonConfiguration(mtm);
-        config.setTitle(Some(&NSString::from_str("Touch Controls…")));
+        config.setTitle(Some(&NSString::from_str("Settings…")));
         controls.setConfiguration(Some(&config));
         // SAFETY: as for `choose:`
         unsafe { controls.addTarget_action_forControlEvents(Some(&self.delegate), sel!(controls:), UIControlEvents::TouchUpInside) };

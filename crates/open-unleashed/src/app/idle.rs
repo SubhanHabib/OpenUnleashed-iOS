@@ -45,13 +45,13 @@ fn same_sprite(a: &Sprite, b: &Sprite) -> bool {
 }
 
 impl App {
-    /// The optional **frame cap**: `NFS_FPS_CAP=<n>` holds the redraw loop to at most `n` frames a
+    /// The optional **frame cap** ([`App::fps_cap`]): `NFS_FPS_CAP=<n>` (or iOS's Frame rate option) holds the redraw loop to at most `n` frames a
     /// second by sleeping out the rest of the frame (default off: the loop runs at the display's
     /// pace, as before). Called at the top of every redraw arm, before the frame's `dt` is read, so
     /// the sleep is part of that frame's time.
     // PORT-DEVIATION D4 (RE/notes/PORT-DEVIATIONS.md): NFS_FPS_CAP, opt-in and off by default; the original has no frame cap.
     pub(crate) fn pace_frame(&self) {
-        let user = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0);
+        let user = self.fps_cap;
         // PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): a race whose window is hidden presents at most 30 fps
         let hidden = self.vehicle.is_some() && self.window_hidden();
         let Some(want) = frame_floor(user, hidden) else { return };

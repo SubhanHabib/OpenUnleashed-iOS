@@ -1,8 +1,10 @@
-//! **PLATFORM GLUE (iOS)**: the on-screen controller's options, and the page that sets them.
+//! **PLATFORM GLUE (iOS)**: the on-screen controller's options, the port's display and game options, and the
+//! page that sets them.
 //!
 //! The game's own menus hold only the original's settings, so these live on a small iOS page of their own, opened
 //! from the import screen or with a three-finger tap anywhere in the game (a race is paused first). They are kept
-//! in `touch-controls.txt` in the game's data folder, one `key=value` a line.
+//! in `touch-controls.txt` and `ios-options.txt` in the game's data folder, one `key=value` a line. (A desktop
+//! sets the same options with environment variables and `nfs5.ini`, which an iOS app has no way to set.)
 //!
 //! * **Steering**: the left stick, a d-pad (full lock left or right), the left stick as a touchpad (the finger's
 //!   place on the pad, not its travel from where it landed), or tilting the device like a wheel.
@@ -10,6 +12,9 @@
 //!   buttons, X is the handbrake and Y resets the car.
 //! * **Extra buttons**: X / Y, the shoulders (shift up / down) and the right stick (look left / right), each shown
 //!   or not.
+//!
+//! The display and game options ([`GameOptions`]): the HUD kept inside the safe area, the render resolution, a frame
+//! cap, the weather fog, texture filtering, the intro movies and car-to-car collisions.
 //!
 //! The pad's own buttons stay what SDL reads; [`pad_filter`] rewrites the on-screen pad's snapshot to the chosen
 //! layout before the bindings see it, so the game's bindings (Options › Controls) are not touched.
@@ -142,6 +147,102 @@ impl TouchSettings {
     }
 }
 
+/// The page's display and game options.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GameOptions {
+    /// The race HUD is kept clear of the camera cutout and the home indicator (`App::hud_inset`).
+    pub safe_hud: bool,
+    /// The render target's size as a fraction of the screen's pixels (`App::render_scale`).
+    pub resolution: f32,
+    /// The most frames a second, 0: no cap (`App::fps_cap`).
+    pub fps_cap: u32,
+    /// `nfs5.ini`'s `Fog` (off when either is).
+    pub fog: bool,
+    /// `nfs5.ini`'s `Filtering` (off when either is); at the next start, when the renderer is made.
+    pub filtering: bool,
+    /// `nfs5.ini`'s `NoMovies` (on when either is).
+    pub skip_movies: bool,
+    /// Car-to-car collisions (`NFS_NO_CARCOL` when off).
+    pub car_collisions: bool,
+}
+
+impl GameOptions {
+    pub const DEFAULT: Self =
+        Self { safe_hud: true, resolution: 1.0, fps_cap: 0, fog: true, filtering: true, skip_movies: false, car_collisions: true };
+
+    fn parse(text: &str) -> Self {
+        let mut o = Self::DEFAULT;
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            let on = v == "1" || v.eq_ignore_ascii_case("true");
+            match k {
+                "safe_hud" => o.safe_hud = on,
+                "resolution" => {
+                    if let Some(r) = RESOLUTION.iter().map(|r| r.1).find(|r| v.parse::<f32>().is_ok_and(|f| (f - r).abs() < 0.01)) {
+                        o.resolution = r;
+                    }
+                }
+                "fps_cap" => o.fps_cap = v.parse().ok().filter(|c| FRAME_RATE.iter().any(|f| f.1 == *c)).unwrap_or(0),
+                "fog" => o.fog = on,
+                "filtering" => o.filtering = on,
+                "skip_movies" => o.skip_movies = on,
+                "car_collisions" => o.car_collisions = on,
+                _ => {}
+            }
+        }
+        o
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "safe_hud={}\nresolution={:.2}\nfps_cap={}\nfog={}\nfiltering={}\nskip_movies={}\ncar_collisions={}\n",
+            self.safe_hud as u8,
+            self.resolution,
+            self.fps_cap,
+            self.fog as u8,
+            self.filtering as u8,
+            self.skip_movies as u8,
+            self.car_collisions as u8
+        )
+    }
+}
+
+/// The options now in use.
+static OPTIONS: RwLock<GameOptions> = RwLock::new(GameOptions::DEFAULT);
+/// Set when the options changed; taken by [`take_options_changed`].
+static OPTIONS_CHANGED: AtomicBool = AtomicBool::new(false);
+
+pub fn options() -> GameOptions {
+    OPTIONS.read().map(|o| *o).unwrap_or(GameOptions::DEFAULT)
+}
+
+/// The options changed since the last call.
+pub fn take_options_changed() -> bool {
+    OPTIONS_CHANGED.swap(false, Ordering::Relaxed)
+}
+
+fn options_path() -> PathBuf {
+    nfs_assets::platform::data_dir().join("ios-options.txt")
+}
+
+fn store_options(o: GameOptions) {
+    if let Ok(mut c) = OPTIONS.write() {
+        if *c == o {
+            return;
+        }
+        *c = o;
+    }
+    OPTIONS_CHANGED.store(true, Ordering::Relaxed);
+    let p = options_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&p, o.text()) {
+        tracing::warn!(error = %e, path = %p.display(), "options not saved");
+    }
+}
+
 /// The settings now in use.
 static CURRENT: RwLock<TouchSettings> = RwLock::new(TouchSettings::DEFAULT);
 /// Set when the settings changed; taken by [`take_changed`].
@@ -174,6 +275,11 @@ pub fn init() {
     tracing::info!(?s, "touch controls");
     if let Ok(mut c) = CURRENT.write() {
         *c = s;
+    }
+    let o = std::fs::read_to_string(options_path()).map(|t| GameOptions::parse(&t)).unwrap_or(GameOptions::DEFAULT);
+    tracing::info!(?o, "options");
+    if let Ok(mut c) = OPTIONS.write() {
+        *c = o;
     }
     nfs_input::gamepad::set_pad_filter(pad_filter);
 }
@@ -334,6 +440,8 @@ impl Tilt {
 const STEERING: [(&str, Steering); 4] =
     [("Stick", Steering::Stick), ("D-pad", Steering::DPad), ("Touchpad", Steering::Touchpad), ("Tilt", Steering::Tilt)];
 const PEDALS: [(&str, Pedals); 2] = [("Triggers (analogue)", Pedals::Triggers), ("A / B buttons", Pedals::Buttons)];
+const RESOLUTION: [(&str, f32); 3] = [("Full", 1.0), ("75%", 0.75), ("50%", 0.5)];
+const FRAME_RATE: [(&str, u32); 3] = [("Unlimited", 0), ("60 fps", 60), ("30 fps", 30)];
 
 struct Controls {
     vc: Retained<UIViewController>,
@@ -345,6 +453,13 @@ struct Controls {
     tilt: Retained<UISlider>,
     tilt_row: Retained<UIStackView>,
     legend: Retained<UILabel>,
+    resolution: Retained<UISegmentedControl>,
+    frame_rate: Retained<UISegmentedControl>,
+    safe_hud: Retained<UISwitch>,
+    fog: Retained<UISwitch>,
+    filtering: Retained<UISwitch>,
+    skip_movies: Retained<UISwitch>,
+    car_collisions: Retained<UISwitch>,
 }
 
 pub struct Ivars {
@@ -362,8 +477,9 @@ define_class!(
     impl Page {
         #[unsafe(method(changed:))]
         fn changed(&self, _sender: Option<&AnyObject>) {
-            let Some(s) = self.read() else { return };
+            let Some((s, o)) = self.read() else { return };
             store(s);
+            store_options(o);
             self.show(s);
         }
 
@@ -373,7 +489,7 @@ define_class!(
                 c.vc.dismissViewControllerAnimated_completion(true, None);
             }
             OPEN.store(false, Ordering::Relaxed);
-            tracing::info!(s = ?current(), "touch controls page closed");
+            tracing::info!(s = ?current(), o = ?options(), "settings page closed");
             PAGE.with(|p| p.borrow_mut().take());
         }
     }
@@ -387,11 +503,20 @@ thread_local! {
 }
 
 impl Page {
-    fn read(&self) -> Option<TouchSettings> {
+    fn read(&self) -> Option<(TouchSettings, GameOptions)> {
         let c = self.ivars().controls.borrow();
         let c = c.as_ref()?;
         let pick = |seg: &UISegmentedControl| seg.selectedSegmentIndex().max(0) as usize;
-        Some(TouchSettings {
+        let o = GameOptions {
+            safe_hud: c.safe_hud.isOn(),
+            resolution: RESOLUTION.get(pick(&c.resolution)).map_or(1.0, |r| r.1),
+            fps_cap: FRAME_RATE.get(pick(&c.frame_rate)).map_or(0, |f| f.1),
+            fog: c.fog.isOn(),
+            filtering: c.filtering.isOn(),
+            skip_movies: c.skip_movies.isOn(),
+            car_collisions: c.car_collisions.isOn(),
+        };
+        let s = TouchSettings {
             steering: STEERING.get(pick(&c.steering)).map_or(Steering::Stick, |s| s.1),
             pedals: PEDALS.get(pick(&c.pedals)).map_or(Pedals::Triggers, |p| p.1),
             xy: c.xy.isOn(),
@@ -399,7 +524,8 @@ impl Page {
             right_stick: c.right_stick.isOn(),
             // in steps of 0.05
             tilt_sensitivity: (c.tilt.value() * 20.0).round() / 20.0,
-        })
+        };
+        Some((s, o))
     }
 
     /// The parts of the page that follow the settings.
@@ -427,7 +553,7 @@ pub fn present(presenter: &UIViewController) {
     page.show(s);
     PAGE.with(|p| *p.borrow_mut() = Some(page));
     OPEN.store(true, Ordering::Relaxed);
-    tracing::info!("touch controls page opened");
+    tracing::info!("settings page opened");
     presenter.presentViewController_animated_completion(&vc, true, None);
 }
 
@@ -481,7 +607,9 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let root = vc.view().expect("a view controller's view");
     root.setBackgroundColor(Some(&UIColor::colorWithRed_green_blue_alpha(0.08, 0.08, 0.09, 1.0)));
 
-    let title = label(mtm, "Touch Controls", UIFont::boldSystemFontOfSize(26.0), 1.0);
+    let title = label(mtm, "Settings", UIFont::boldSystemFontOfSize(26.0), 1.0);
+    let o = options();
+    let touch_h = label(mtm, "Touch controls", UIFont::boldSystemFontOfSize(21.0), 1.0);
     let note = label(
         mtm,
         "The on-screen controller appears in a race when no game controller is connected.",
@@ -512,6 +640,24 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let legend_l = label(mtm, "Buttons", UIFont::boldSystemFontOfSize(15.0), 0.75);
     let legend = label(mtm, "", UIFont::systemFontOfSize(14.0), 0.8);
 
+    let display_h = label(mtm, "Display", UIFont::boldSystemFontOfSize(21.0), 1.0);
+    let resolution_l = label(mtm, "Resolution (lower: faster, cooler, longer battery)", UIFont::boldSystemFontOfSize(15.0), 0.75);
+    let resolution = segments(mtm, page, &RESOLUTION.map(|r| r.0), RESOLUTION.iter().position(|x| x.1 == o.resolution).unwrap_or(0));
+    let frame_rate_l = label(mtm, "Frame rate", UIFont::boldSystemFontOfSize(15.0), 0.75);
+    let frame_rate = segments(mtm, page, &FRAME_RATE.map(|f| f.0), FRAME_RATE.iter().position(|x| x.1 == o.fps_cap).unwrap_or(0));
+    let (safe_row, safe_hud) = switch_row(mtm, page, "Keep the race HUD clear of the camera cutout", o.safe_hud);
+    let (fog_row, fog) = switch_row(mtm, page, "Weather fog", o.fog);
+    let (filter_row, filtering) = switch_row(mtm, page, "Smooth textures (from the next start)", o.filtering);
+    let game_h = label(mtm, "Game", UIFont::boldSystemFontOfSize(21.0), 1.0);
+    let (movies_row, skip_movies) = switch_row(mtm, page, "Skip the intro movies", o.skip_movies);
+    let (col_row, car_collisions) = switch_row(mtm, page, "Car-to-car collisions", o.car_collisions);
+    let ini_note = label(
+        mtm,
+        "Fog, smooth textures and the intro movies follow the game folder's nfs5.ini too: an option turned off there stays off.",
+        UIFont::systemFontOfSize(13.0),
+        0.6,
+    );
+
     let done = UIButton::buttonWithType(UIButtonType::System, mtm);
     let config = UIButtonConfiguration::filledButtonConfiguration(mtm);
     config.setTitle(Some(&NSString::from_str("Done")));
@@ -519,9 +665,10 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     // SAFETY: as in `segments`
     unsafe { done.addTarget_action_forControlEvents(Some(page), sel!(done:), UIControlEvents::TouchUpInside) };
 
-    let views: [&UIView; 14] = [
-        &title, &note, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l, &legend,
-        &done,
+    let views: [&UIView; 27] = [
+        &title, &touch_h, &note, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
+        &legend, &display_h, &resolution_l, &resolution, &frame_rate_l, &frame_rate, &safe_row, &fog_row, &filter_row, &game_h,
+        &movies_row, &col_row, &ini_note, &done,
     ];
     let content = stack(mtm, &views, UILayoutConstraintAxis::Vertical, 12.0);
     content.setAlignment(UIStackViewAlignment::Fill);
@@ -529,10 +676,14 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     content.setCustomSpacing_afterView(20.0, &tilt_row);
     content.setCustomSpacing_afterView(20.0, &pedals);
     content.setCustomSpacing_afterView(20.0, &rs_row);
-    content.setCustomSpacing_afterView(24.0, &legend);
+    content.setCustomSpacing_afterView(32.0, &legend);
+    content.setCustomSpacing_afterView(20.0, &title);
+    content.setCustomSpacing_afterView(20.0, &frame_rate);
+    content.setCustomSpacing_afterView(32.0, &filter_row);
+    content.setCustomSpacing_afterView(24.0, &ini_note);
     content.setTranslatesAutoresizingMaskIntoConstraints(false);
     title.setTextAlignment(NSTextAlignment::Center);
-    note.setTextAlignment(NSTextAlignment::Center);
+    note.setTextAlignment(NSTextAlignment::Left);
 
     let scroll = UIScrollView::new(mtm);
     scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -555,7 +706,24 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
         c.setActive(true);
     }
 
-    Controls { vc, steering, pedals, xy, shoulders, right_stick, tilt, tilt_row, legend }
+    Controls {
+        vc,
+        steering,
+        pedals,
+        xy,
+        shoulders,
+        right_stick,
+        tilt,
+        tilt_row,
+        legend,
+        resolution,
+        frame_rate,
+        safe_hud,
+        fog,
+        filtering,
+        skip_movies,
+        car_collisions,
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +735,9 @@ mod tests {
         let s = TouchSettings { steering: Steering::Tilt, pedals: Pedals::Buttons, xy: false, shoulders: true, right_stick: true, tilt_sensitivity: 1.5 };
         assert_eq!(TouchSettings::parse(&s.text()), s);
         assert_eq!(TouchSettings::parse(""), TouchSettings::DEFAULT);
+        let o = GameOptions { safe_hud: false, resolution: 0.75, fps_cap: 30, fog: false, filtering: false, skip_movies: true, car_collisions: false };
+        assert_eq!(GameOptions::parse(&o.text()), o);
+        assert_eq!(GameOptions::parse("resolution=0.3\nfps_cap=45"), GameOptions::DEFAULT);
     }
 
     #[test]

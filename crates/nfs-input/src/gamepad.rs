@@ -131,7 +131,14 @@ impl Drop for Device {
 pub struct Devices {
     list: Vec<Device>,
     haptic: bool,
+    /// PLATFORM GLUE: a rumble target that is not a pad (the iPhone's own vibration motor), used
+    /// when no connected device can rumble: its name for the log, and the call.
+    fallback: Option<(String, RumbleFallback)>,
 }
+
+/// A rumble call as [`Devices::rumble`] takes it (`low` / `high` 0…65535, for `ms`; 0, 0 stops),
+/// for a target outside SDL; false when it was refused.
+pub type RumbleFallback = Box<dyn FnMut(u16, u16, u32) -> bool>;
 
 const SUBSYSTEMS: SDL_InitFlags = SDL_InitFlags(SDL_INIT_JOYSTICK.0 | SDL_INIT_GAMEPAD.0);
 
@@ -159,7 +166,7 @@ impl Devices {
             if !haptic {
                 tracing::warn!(error = %sdl_error(), "SDL haptic subsystem unavailable (no wheel force feedback)");
             }
-            let mut d = Self { list: Vec::new(), haptic };
+            let mut d = Self { list: Vec::new(), haptic, fallback: None };
             let mut n = 0;
             let ids = SDL_GetJoysticks(&mut n);
             if !ids.is_null() {
@@ -240,17 +247,22 @@ impl Devices {
 
     /// The name of the first open device that can rumble.
     pub(crate) fn rumble_device_name(&self) -> Option<&str> {
-        self.list.iter().find(|d| d.can_rumble()).map(|d| d.name.as_str())
+        self.list.iter().find(|d| d.can_rumble()).map(|d| d.name.as_str()).or(self.fallback.as_ref().map(|f| f.0.as_str()))
     }
 
     /// `SDL_RumbleGamepad` (`SDL_RumbleJoystick` on a raw device) on the first device that can:
     /// `low` / `high` are the strong / weak motors, 0…65535, for `ms`.
     pub(crate) fn rumble(&mut self, low: u16, high: u16, ms: u32) -> bool {
-        match self.list.iter().find(|d| d.can_rumble()) {
+        let pad = self.list.iter().find(|d| d.can_rumble());
+        if let (Some(_), Some(f)) = (pad, self.fallback.as_mut()) {
+            // a pad that arrived while the fallback was rumbling: the fallback stops
+            (f.1)(0, 0, 0);
+        }
+        match pad {
             // SAFETY: the handles are open for as long as the device is in the list
             Some(d) if !d.pad.is_null() => unsafe { SDL_RumbleGamepad(d.pad, low, high, ms) },
             Some(d) => unsafe { SDL_RumbleJoystick(d.joy, low, high, ms) },
-            None => false,
+            None => self.fallback.as_mut().is_some_and(|f| (f.1)(low, high, ms)),
         }
     }
 
@@ -437,7 +449,19 @@ impl Gamepads {
         std::mem::take(&mut self.pad_hotplug)
     }
 
-    /// Whether a pad that can rumble is connected (`SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN`).
+    /// PLATFORM GLUE: rumble a target that is not a pad (`name` for the log) whenever no connected
+    /// device can rumble; `None` removes it. A pad that can rumble always comes first.
+    pub fn set_rumble_fallback(&mut self, fallback: Option<(String, RumbleFallback)>) {
+        if let Some(d) = self.devices.as_mut() {
+            if fallback.is_none() {
+                self.rumbler.stop_all(d);
+            }
+            d.fallback = fallback;
+        }
+    }
+
+    /// Whether a pad that can rumble is connected (`SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN`), or the
+    /// [`Self::set_rumble_fallback`] target.
     pub fn rumble_supported(&self) -> bool {
         self.devices.as_ref().is_some_and(|d| self.rumbler.supported(d))
     }

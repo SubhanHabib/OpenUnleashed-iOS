@@ -144,10 +144,18 @@ struct GpuTexture {
     /// A replacement texture (`texpack`): the original's `(width, height, levels)`, and the
     /// replacement's own `(width, height, levels)` the GPU texture has
     replaced: Option<(TexShape, TexShape)>,
+    /// A replaced texture's original level 0, and the replacement's level 0 once the game first
+    /// rewrote it (a car's damage, `texpack::composite`)
+    replaced_src: Option<Box<ReplacedSrc>>,
 }
 
 /// A texture's `(width, height, levels)`.
 type TexShape = (u32, u32, usize);
+
+struct ReplacedSrc {
+    orig: Vec<u8>,
+    pack: Option<Vec<u8>>,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1385,6 +1393,7 @@ impl Core {
         // PORT-DEVIATION (opt-in enhancement): texture packs, the dump and the on-device enhancer (`texpack`)
         let replacement = crate::texpack::active().then(|| mips.first().and_then(|l0| crate::texpack::replace(width, height, mips.len(), l0, true))).flatten();
         let orig = (width, height, mips.len());
+        let replaced_src = replacement.as_ref().and_then(|_| mips.first()).map(|l0| Box::new(ReplacedSrc { orig: l0.clone(), pack: None }));
         let (width, height, mips) = match &replacement {
             Some(r) => (r.width, r.height, r.mips.as_slice()),
             None => (width, height, mips),
@@ -1420,23 +1429,39 @@ impl Core {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sprite_sampler) }],
         }));
         tracing::debug!(w = width, h = height, "texture uploaded");
-        GpuTexture { _texture: texture, view, sprite_bg, replaced }
+        GpuTexture { _texture: texture, view, sprite_bg, replaced, replaced_src }
     }
 
 
     /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
     /// rest is ignored; less and the level is skipped).
     pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
-        let Some(tex) = self.textures.get(id.0 as usize) else { return };
-        // a replaced texture (`texpack`) takes the new pixels replaced again, or scaled up to its size, its
-        // levels rebuilt from the new top level (the original's lower levels are not used)
+        let Some(tex) = self.textures.get_mut(id.0 as usize) else { return };
+        // a replaced texture (`texpack`) takes the new pixels replaced again; else the replacement where
+        // the new pixels are the original's and the new ones scaled up where they changed (a car's
+        // damage, `texpack::composite`); its levels rebuilt from the new top level (the original's lower
+        // levels are not used)
         if let Some(((ow, oh, olevels), (rw, rh, rlevels))) = tex.replaced {
             if level != 0 || (w, h) != (ow, oh) || data.len() < 4 * w as usize * h as usize {
                 return;
             }
-            let r = crate::texpack::replace(w, h, olevels, data, false)
-                .filter(|r| (r.width, r.height) == (rw, rh) && r.mips.len() == rlevels)
-                .unwrap_or_else(|| crate::texpack::resized(w, h, data, rw, rh, rlevels));
+            let fits = |r: &crate::texpack::Replaced| (r.width, r.height) == (rw, rh) && r.mips.len() == rlevels;
+            let r = match crate::texpack::replace(w, h, olevels, data, false).filter(fits) {
+                Some(r) => r,
+                None => match tex.replaced_src.as_deref_mut() {
+                    Some(src) => {
+                        if src.pack.is_none() {
+                            src.pack = crate::texpack::replace(w, h, olevels, &src.orig, false).filter(fits).and_then(|r| r.mips.into_iter().next());
+                            tracing::info!(w, h, kept = src.pack.is_some(), "rewritten replaced texture: the replacement kept where it did not change");
+                        }
+                        match &src.pack {
+                            Some(pack) => crate::texpack::composite(w, h, &src.orig, data, pack, rw, rh, rlevels),
+                            None => crate::texpack::resized(w, h, data, rw, rh, rlevels),
+                        }
+                    }
+                    None => crate::texpack::resized(w, h, data, rw, rh, rlevels),
+                },
+            };
             let (mut lw, mut lh) = (rw, rh);
             for (l, m) in r.mips.iter().enumerate() {
                 self.queue_texture_level_raw(id, l as u32, lw, lh, m);
@@ -1778,7 +1803,7 @@ impl Core {
                     layout: &self.sprite_layout,
                     entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
                 }));
-                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, replaced: None });
+                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, replaced: None, replaced_src: None });
                 let id = TextureId(self.textures.len() as u32 - 1);
                 self.offscreen.insert(id.0, (width, height));
                 id

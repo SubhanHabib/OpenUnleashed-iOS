@@ -286,6 +286,16 @@ pub fn zip_target(root: &str, name: &str) -> Option<PathBuf> {
     Some(p)
 }
 
+/// Whether the `.zip` at `zip_path` holds a game folder (reads only its list of entries). A saves backup or any
+/// other archive the player keeps next to the game is not one.
+#[cfg(feature = "import")]
+pub fn zip_holds_game(zip_path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(zip_path) else { return false };
+    let Ok(zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else { return false };
+    let names: Vec<String> = zip.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
+    zip_root(names.iter().map(String::as_str)).is_some()
+}
+
 /// Unpacks the game out of the `.zip` at `zip_path` into `dest` (replacing what was there).
 #[cfg(feature = "import")]
 pub fn import_zip(zip_path: &Path, dest: &Path, progress: &Progress) -> Result<(), ImportError> {
@@ -430,5 +440,148 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("GameData/Track/a.frd")).unwrap(), b"track");
         assert_eq!(std::fs::read(dest.join("nfs5.exe")).unwrap(), b"MZn");
         assert!(!dest.join("Drivers").exists());
+    }
+}
+
+/// PLATFORM GLUE (iOS save backup): the files of `dir` and its sub-folders into a new `.zip` at `zip_path`
+/// (paths relative to `dir`, `/`-separated); the number of files.
+#[cfg(feature = "import")]
+pub fn zip_folder(dir: &Path, zip_path: &Path) -> Result<usize, ImportError> {
+    use std::io::Write;
+    let zerr = |e: zip::result::ZipError| ImportError::Zip { path: zip_path.to_path_buf(), msg: e.to_string() };
+    let file = std::fs::File::create(zip_path).map_err(io_at(zip_path))?;
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut stack = vec![dir.to_path_buf()];
+    let mut n = 0;
+    while let Some(d) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&d).map_err(io_at(&d))?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if is_junk(&e.file_name().to_string_lossy()) {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let Ok(rel) = p.strip_prefix(dir) else { continue };
+            let name = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+            let data = std::fs::read(&p).map_err(io_at(&p))?;
+            zip.start_file(name, opts).map_err(zerr)?;
+            zip.write_all(&data).map_err(io_at(zip_path))?;
+            n += 1;
+        }
+    }
+    zip.finish().map_err(zerr)?.flush().map_err(io_at(zip_path))?;
+    Ok(n)
+}
+
+/// PLATFORM GLUE (iOS save restore): unpacks a `.zip` of a folder into `dest`, replacing it. The folder in the
+/// archive is the one that holds the first entry `is_key` accepts (a backup of [`zip_folder`], or one the Files
+/// app compressed, with the folder's own name in front); entries outside it, and any that would leave it, are
+/// skipped. Nothing is changed when the archive has no such entry or cannot be read. The number of files.
+#[cfg(feature = "import")]
+pub fn unzip_folder(zip_path: &Path, dest: &Path, is_key: impl Fn(&str) -> bool) -> Result<usize, ImportError> {
+    let zerr = |e: zip::result::ZipError| ImportError::Zip { path: zip_path.to_path_buf(), msg: e.to_string() };
+    let file = std::fs::File::open(zip_path).map_err(io_at(zip_path))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(zerr)?;
+    let mut root: Option<PathBuf> = None;
+    for i in 0..zip.len() {
+        let e = zip.by_index_raw(i).map_err(zerr)?;
+        let Some(p) = e.enclosed_name() else { continue };
+        if !e.is_dir() && p.file_name().is_some_and(|n| is_key(&n.to_string_lossy())) && !p.components().any(|c| is_junk(&c.as_os_str().to_string_lossy())) {
+            root = Some(p.parent().map(Path::to_path_buf).unwrap_or_default());
+            break;
+        }
+    }
+    let root = root.ok_or_else(|| ImportError::Zip { path: zip_path.to_path_buf(), msg: "no saved game in it".into() })?;
+    let staging = dest.with_extension("restoring");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(io_at(&staging))?;
+    let r = (|| {
+        let mut n = 0;
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).map_err(zerr)?;
+            let Some(p) = e.enclosed_name() else { continue };
+            let Ok(rel) = p.strip_prefix(&root) else { continue };
+            if e.is_dir() || rel.as_os_str().is_empty() || rel.components().any(|c| is_junk(&c.as_os_str().to_string_lossy())) {
+                continue;
+            }
+            let out = staging.join(rel);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(io_at(parent))?;
+            }
+            let mut f = std::fs::File::create(&out).map_err(io_at(&out))?;
+            io::copy(&mut e, &mut f).map_err(io_at(&out))?;
+            n += 1;
+        }
+        Ok(n)
+    })();
+    match r {
+        Ok(n) => {
+            let _ = std::fs::remove_dir_all(dest);
+            std::fs::rename(&staging, dest).map_err(io_at(dest))?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "import"))]
+mod backup_tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_restores_and_a_compressed_folder_too() {
+        let base = std::env::temp_dir().join(format!("ou-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let saves = base.join("SaveData");
+        std::fs::create_dir_all(saves.join("sub")).unwrap();
+        std::fs::write(saves.join("player.lst"), b"list").unwrap();
+        std::fs::write(saves.join("0Me.sav"), b"career").unwrap();
+        std::fs::write(saves.join("sub/x.bin"), b"x").unwrap();
+        let zip = base.join("b.zip");
+        assert_eq!(zip_folder(&saves, &zip).unwrap(), 3);
+        let key = |n: &str| n.eq_ignore_ascii_case("player.lst");
+        let back = base.join("Restored");
+        std::fs::create_dir_all(&back).unwrap();
+        std::fs::write(back.join("old.sav"), b"old").unwrap();
+        assert_eq!(unzip_folder(&zip, &back, key).unwrap(), 3);
+        assert_eq!(std::fs::read(back.join("0Me.sav")).unwrap(), b"career");
+        assert_eq!(std::fs::read(back.join("sub/x.bin")).unwrap(), b"x");
+        assert!(!back.join("old.sav").exists());
+        // the Files app's "Compress": the folder's name in front
+        let outer = base.join("Outer");
+        std::fs::create_dir_all(&outer).unwrap();
+        std::fs::rename(&saves, outer.join("SaveData")).unwrap();
+        let zip2 = base.join("c.zip");
+        zip_folder(&outer, &zip2).unwrap();
+        let again = base.join("Again");
+        assert_eq!(unzip_folder(&zip2, &again, key).unwrap(), 3);
+        assert!(again.join("player.lst").exists());
+        // no save in it: nothing changes
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("a.txt"), b"a").unwrap();
+        let zip3 = base.join("d.zip");
+        zip_folder(&empty, &zip3).unwrap();
+        assert!(unzip_folder(&zip3, &again, key).is_err());
+        assert!(again.join("player.lst").exists());
+        // a saves backup is not mistaken for a .zip of the game; a zipped game folder is one
+        assert!(!zip_holds_game(&zip) && !zip_holds_game(&zip2));
+        let game = base.join("Game/Porsche");
+        std::fs::create_dir_all(game.join("GameData")).unwrap();
+        std::fs::create_dir_all(game.join("FEData")).unwrap();
+        std::fs::write(game.join("GameData/a.bin"), b"a").unwrap();
+        std::fs::write(game.join("FEData/b.bin"), b"b").unwrap();
+        let zip4 = base.join("g.zip");
+        zip_folder(&base.join("Game"), &zip4).unwrap();
+        assert!(zip_holds_game(&zip4));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

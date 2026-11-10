@@ -14,6 +14,8 @@
 //!   is turned into the mouse the front end already reads (`touch.rs`). An on-screen controller is shown
 //!   in a race when no physical pad is connected; its layout is set on the touch-controls page (`settings.rs`).
 
+mod backup;
+mod haptics;
 mod importer;
 pub(crate) mod settings;
 pub(crate) mod touch;
@@ -132,7 +134,25 @@ impl Root {
         // read when the renderer is made: from the next start
         nfs_renderer::set_point_filter(!(ini.filtering && o.filtering));
         Self::apply_textures(&o);
+        Self::apply_haptics(app, o.haptics);
         tracing::info!(?o, "options applied");
+    }
+
+    /// The force feedback on the iPhone's vibration motor (`haptics.rs`) while no pad can rumble; the engine is made
+    /// once, when the option turns on.
+    fn apply_haptics(app: &mut App, on: bool) {
+        thread_local! {
+            static ON: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        }
+        if ON.with(|c| c.replace(Some(on))) == Some(on) {
+            return;
+        }
+        let phone = on.then(haptics::PhoneRumble::new).flatten();
+        tracing::info!(on, available = phone.is_some(), "phone vibration");
+        app.gamepads.set_rumble_fallback(phone.map(|mut p| {
+            let f: nfs_input::gamepad::RumbleFallback = Box::new(move |low, high, ms| p.rumble(low, high, ms));
+            ("the iPhone's vibration motor".to_string(), f)
+        }));
     }
 
     /// The texture options, read as textures load: they take hold for what loads after (in full, from the next start).

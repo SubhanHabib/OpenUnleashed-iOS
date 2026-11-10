@@ -47,7 +47,7 @@ mod fe_seq;
 mod idle;
 mod quickfix;
 mod init;
-mod photo;
+pub(crate) mod photo;
 pub(crate) use quickfix::*;
 pub(crate) use init::AppInit;
 pub(crate) use scripted::*;

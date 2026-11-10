@@ -23,13 +23,16 @@ use nfs_input::gamepad::PadSnapshot;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{DefinedClass, Encode, Encoding, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString};
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_uniform_type_identifiers::UTTypeZIP;
 use objc2_ui_kit::{
     NSTextAlignment, UIButton, UIButtonConfiguration, UIButtonType, UIColor, UIControlEvents, UIFont, UILabel,
     UILayoutConstraintAxis, UIModalPresentationStyle, UIScrollView, UISegmentedControl, UISlider, UIStackView,
-    UIStackViewAlignment, UISwitch, UIView, UIViewController,
+    UIDocumentPickerDelegate, UIDocumentPickerViewController, UIStackViewAlignment, UIStackViewDistribution, UISwitch, UIView,
+    UIViewController,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -172,6 +175,8 @@ pub struct GameOptions {
     pub anisotropic: bool,
     /// The game's textures are saved to `Documents/Textures/_dump` as they load (`nfs_renderer::set_texture_dump`).
     pub dump_textures: bool,
+    /// The force feedback on the iPhone's vibration motor when no pad can rumble (`haptics.rs`).
+    pub haptics: bool,
 }
 
 impl GameOptions {
@@ -182,6 +187,7 @@ impl GameOptions {
         enhance_textures: false,
         anisotropic: false,
         dump_textures: false,
+        haptics: true,
     };
 
     fn parse(text: &str) -> Self {
@@ -206,6 +212,7 @@ impl GameOptions {
                 "enhance_textures" => o.enhance_textures = on,
                 "anisotropic" => o.anisotropic = on,
                 "dump_textures" => o.dump_textures = on,
+                "haptics" => o.haptics = on,
                 _ => {}
             }
         }
@@ -215,7 +222,7 @@ impl GameOptions {
     fn text(&self) -> String {
         format!(
             "safe_hud={}\nresolution={:.2}\nfps_cap={}\nfog={}\nfiltering={}\nskip_movies={}\ncar_collisions={}\n\
-             texture_packs={}\nenhance_textures={}\nanisotropic={}\ndump_textures={}\n",
+             texture_packs={}\nenhance_textures={}\nanisotropic={}\ndump_textures={}\nhaptics={}\n",
             self.safe_hud as u8,
             self.resolution,
             self.fps_cap,
@@ -226,7 +233,8 @@ impl GameOptions {
             self.texture_packs as u8,
             self.enhance_textures as u8,
             self.anisotropic as u8,
-            self.dump_textures as u8
+            self.dump_textures as u8,
+            self.haptics as u8
         )
     }
 }
@@ -487,10 +495,16 @@ struct Controls {
     enhance_textures: Retained<UISwitch>,
     anisotropic: Retained<UISwitch>,
     dump_textures: Retained<UISwitch>,
+    haptics: Retained<UISwitch>,
+    saves_status: Retained<UILabel>,
 }
 
 pub struct Ivars {
     controls: RefCell<Option<Controls>>,
+    /// the document picker up is the save import's (not the export's)
+    importing: Cell<bool>,
+    /// saves were imported: Done closes the app, which reads them at its next start
+    restart: Cell<bool>,
 }
 
 define_class!(
@@ -517,11 +531,72 @@ define_class!(
             }
             OPEN.store(false, Ordering::Relaxed);
             tracing::info!(s = ?current(), o = ?options(), "settings page closed");
+            if self.ivars().restart.get() {
+                tracing::info!("closing after the save import");
+                crate::guard::end();
+                std::process::exit(0);
+            }
             PAGE.with(|p| p.borrow_mut().take());
+        }
+
+        #[unsafe(method(exportSaves:))]
+        fn export_saves(&self, _sender: Option<&AnyObject>) {
+            match super::backup::export() {
+                Ok(zip) => {
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(&zip.to_string_lossy()));
+                    let mtm = self.mtm();
+                    let picker = UIDocumentPickerViewController::initForExportingURLs_asCopy(
+                        UIDocumentPickerViewController::alloc(mtm),
+                        &NSArray::from_retained_slice(&[url]),
+                        true,
+                    );
+                    self.ivars().importing.set(false);
+                    self.present_picker(&picker);
+                }
+                Err(e) => self.saves_status(&e),
+            }
+        }
+
+        #[unsafe(method(importSaves:))]
+        fn import_saves(&self, _sender: Option<&AnyObject>) {
+            let mtm = self.mtm();
+            // SAFETY: the system type constant
+            let zip = unsafe { UTTypeZIP };
+            let picker = UIDocumentPickerViewController::initForOpeningContentTypes_asCopy(
+                UIDocumentPickerViewController::alloc(mtm),
+                &NSArray::from_slice(&[zip]),
+                true,
+            );
+            picker.setAllowsMultipleSelection(false);
+            self.ivars().importing.set(true);
+            self.present_picker(&picker);
         }
     }
 
     unsafe impl NSObjectProtocol for Page {}
+
+    unsafe impl UIDocumentPickerDelegate for Page {
+        #[unsafe(method(documentPicker:didPickDocumentsAtURLs:))]
+        fn did_pick(&self, _controller: &UIDocumentPickerViewController, urls: &NSArray<NSURL>) {
+            if !self.ivars().importing.get() {
+                self.saves_status("Saves exported.");
+                return;
+            }
+            let Some(path) = urls.firstObject().and_then(|u| u.path()) else { return };
+            let path = PathBuf::from(path.to_string());
+            match super::backup::import(&path) {
+                Ok(n) => {
+                    self.ivars().restart.set(true);
+                    self.saves_status(&format!(
+                        "{n} files imported (the saves they replaced are in Files › {} › Save Backups). Tap Done: the app closes, and loads them when you open it again.",
+                        crate::brand::TITLE
+                    ));
+                }
+                Err(e) => self.saves_status(&e),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 );
 
 thread_local! {
@@ -530,6 +605,21 @@ thread_local! {
 }
 
 impl Page {
+    fn present_picker(&self, picker: &UIDocumentPickerViewController) {
+        let c = self.ivars().controls.borrow();
+        let Some(c) = c.as_ref() else { return };
+        picker.setDelegate(Some(ProtocolObject::from_ref(self)));
+        c.vc.presentViewController_animated_completion(picker, true, None);
+    }
+
+    fn saves_status(&self, text: &str) {
+        tracing::info!(text, "save backup");
+        if let Some(c) = self.ivars().controls.borrow().as_ref() {
+            c.saves_status.setText(Some(&NSString::from_str(text)));
+            c.saves_status.setHidden(false);
+        }
+    }
+
     fn read(&self) -> Option<(TouchSettings, GameOptions)> {
         let c = self.ivars().controls.borrow();
         let c = c.as_ref()?;
@@ -546,6 +636,7 @@ impl Page {
             enhance_textures: c.enhance_textures.isOn(),
             anisotropic: c.anisotropic.isOn(),
             dump_textures: c.dump_textures.isOn(),
+            haptics: c.haptics.isOn(),
         };
         let s = TouchSettings {
             steering: STEERING.get(pick(&c.steering)).map_or(Steering::Stick, |s| s.1),
@@ -574,7 +665,7 @@ pub fn present(presenter: &UIViewController) {
         return;
     }
     let mtm = MainThreadMarker::new().expect("main thread");
-    let page = Page::alloc(mtm).set_ivars(Ivars { controls: RefCell::new(None) });
+    let page = Page::alloc(mtm).set_ivars(Ivars { controls: RefCell::new(None), importing: Cell::new(false), restart: Cell::new(false) });
     // SAFETY: `NSObject`'s designated initialiser
     let page: Retained<Page> = unsafe { msg_send![super(page), init] };
     let s = current();
@@ -682,8 +773,27 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let game_h = label(mtm, "Game", UIFont::boldSystemFontOfSize(21.0), 1.0);
     let (movies_row, skip_movies) = switch_row(mtm, page, "Skip the intro movies", o.skip_movies);
     let (col_row, car_collisions) = switch_row(mtm, page, "Car-to-car collisions", o.car_collisions);
+    let (haptics_row, haptics) = switch_row(mtm, page, "Vibrate with the force feedback (when no controller rumbles)", o.haptics);
+    // an iPad has no vibration motor
+    haptics_row.setHidden(!super::haptics::supported());
+    let saves_h = label(mtm, "Saves", UIFont::boldSystemFontOfSize(21.0), 1.0);
+    let saves_note = label(
+        mtm,
+        &format!(
+            "Export puts your saves in a .zip you can keep in iCloud Drive or another app. Import replaces the saves with such a .zip; the ones it replaces are kept in Files › {} › Save Backups.",
+            crate::brand::TITLE
+        ),
+        UIFont::systemFontOfSize(13.0),
+        0.6,
+    );
+    let export_b = plain_button(mtm, page, "Export Saves…", sel!(exportSaves:));
+    let import_b = plain_button(mtm, page, "Import Saves…", sel!(importSaves:));
+    let saves_buttons = stack(mtm, &[&export_b, &import_b], UILayoutConstraintAxis::Horizontal, 12.0);
+    saves_buttons.setDistribution(UIStackViewDistribution::FillEqually);
+    let saves_status = label(mtm, "", UIFont::systemFontOfSize(14.0), 0.92);
+    saves_status.setHidden(true);
     let tex_h = label(mtm, "Textures (from the next start)", UIFont::boldSystemFontOfSize(21.0), 1.0);
-    let (packs_row, texture_packs) = switch_row(mtm, page, "Texture packs (Files › Open Unleashed › Textures)", o.texture_packs);
+    let (packs_row, texture_packs) = switch_row(mtm, page, &format!("Texture packs (Files › {} › Textures)", crate::brand::TITLE), o.texture_packs);
     let (enhance_row, enhance_textures) = switch_row(mtm, page, "Enhanced textures (2× upscale, experimental)", o.enhance_textures);
     let (aniso_row, anisotropic) = switch_row(mtm, page, "Sharper road at a distance (anisotropic filtering)", o.anisotropic);
     let (dump_row, dump_textures) = switch_row(mtm, page, "Save the game's textures to Textures/_dump (for pack makers)", o.dump_textures);
@@ -707,10 +817,11 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     // SAFETY: as in `segments`
     unsafe { done.addTarget_action_forControlEvents(Some(page), sel!(done:), UIControlEvents::TouchUpInside) };
 
-    let views: [&UIView; 33] = [
+    let views: [&UIView; 38] = [
         &title, &touch_h, &note, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
         &legend, &display_h, &resolution_l, &resolution, &frame_rate_l, &frame_rate, &safe_row, &fog_row, &filter_row, &game_h,
-        &movies_row, &col_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &ini_note, &done,
+        &movies_row, &col_row, &haptics_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &saves_h, &saves_note,
+        &saves_buttons, &saves_status, &ini_note, &done,
     ];
     let content = stack(mtm, &views, UILayoutConstraintAxis::Vertical, 12.0);
     content.setAlignment(UIStackViewAlignment::Fill);
@@ -722,8 +833,10 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     content.setCustomSpacing_afterView(20.0, &title);
     content.setCustomSpacing_afterView(20.0, &frame_rate);
     content.setCustomSpacing_afterView(32.0, &filter_row);
-    content.setCustomSpacing_afterView(32.0, &col_row);
-    content.setCustomSpacing_afterView(20.0, &tex_note);
+    content.setCustomSpacing_afterView(32.0, &haptics_row);
+    content.setCustomSpacing_afterView(32.0, &tex_note);
+    content.setCustomSpacing_afterView(20.0, &saves_buttons);
+    content.setCustomSpacing_afterView(20.0, &saves_status);
     content.setCustomSpacing_afterView(24.0, &ini_note);
     content.setTranslatesAutoresizingMaskIntoConstraints(false);
     title.setTextAlignment(NSTextAlignment::Center);
@@ -771,7 +884,19 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
         enhance_textures,
         anisotropic,
         dump_textures,
+        haptics,
+        saves_status,
     }
+}
+
+fn plain_button(mtm: MainThreadMarker, page: &Page, title: &str, action: objc2::runtime::Sel) -> Retained<UIButton> {
+    let b = UIButton::buttonWithType(UIButtonType::System, mtm);
+    let config = UIButtonConfiguration::grayButtonConfiguration(mtm);
+    config.setTitle(Some(&NSString::from_str(title)));
+    b.setConfiguration(Some(&config));
+    // SAFETY: as in `segments`
+    unsafe { b.addTarget_action_forControlEvents(Some(page), action, UIControlEvents::TouchUpInside) };
+    b
 }
 
 #[cfg(test)]
@@ -789,6 +914,7 @@ mod tests {
             enhance_textures: true,
             anisotropic: true,
             dump_textures: true,
+            haptics: false,
         };
         assert_eq!(GameOptions::parse(&o.text()), o);
         assert_eq!(GameOptions::parse("resolution=0.3\nfps_cap=45"), GameOptions::DEFAULT);

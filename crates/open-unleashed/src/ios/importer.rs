@@ -357,7 +357,7 @@ fn run_import(src: &Path, drop_in: bool, progress: &Progress) -> Result<(), Stri
     Ok(())
 }
 
-/// A game folder or `.zip` waiting in `Documents` (put there with the Files app or Finder), if any.
+/// A game folder or a `.zip` of one waiting in `Documents` (put there with the Files app or Finder), if any.
 pub fn documents_drop_in() -> Option<PathBuf> {
     let docs = nfs_assets::platform::documents_dir()?;
     if import::is_game_root(&docs) {
@@ -373,7 +373,8 @@ pub fn documents_drop_in() -> Option<PathBuf> {
         if p.is_dir() {
             import::find_game_root(p).is_some()
         } else {
-            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+            // only a .zip of the game: an exported saves .zip may sit here too
+            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && import::zip_holds_game(p)
         }
     })
 }

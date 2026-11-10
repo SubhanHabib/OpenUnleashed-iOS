@@ -253,6 +253,45 @@ pub(crate) fn resized(w: u32, h: u32, px: &[u8], nw: u32, nh: u32, count: usize)
     Replaced { width: nw, height: nh, mips: build_mips(nw, nh, out, count) }
 }
 
+/// A replaced texture the game rewrote (a car's damage blends dents and scratches into its pages):
+/// `new` (`w`×`h`) scaled up to the replacement's `nw`×`nh` where it differs from `orig`, the
+/// replacement `pack` where it does not, with `count` levels. A changed texel takes its
+/// neighbours with it, so the scaled-up edge of a dent does not show the pack's art through it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn composite(w: u32, h: u32, orig: &[u8], new: &[u8], pack: &[u8], nw: u32, nh: u32, count: usize) -> Replaced {
+    let (wu, hu) = (w as usize, h as usize);
+    let n = wu * hu;
+    let changed: Vec<bool> = (0..n).map(|i| (0..4).any(|c| orig[i * 4 + c].abs_diff(new[i * 4 + c]) > 2)).collect();
+    if !changed.iter().any(|&c| c) {
+        return Replaced { width: nw, height: nh, mips: build_mips(nw, nh, pack[..4 * nw as usize * nh as usize].to_vec(), count) };
+    }
+    let mut near = vec![false; n];
+    for y in 0..hu {
+        for x in 0..wu {
+            if changed[y * wu + x] {
+                for yy in y.saturating_sub(1)..=(y + 1).min(hu - 1) {
+                    for xx in x.saturating_sub(1)..=(x + 1).min(wu - 1) {
+                        near[yy * wu + xx] = true;
+                    }
+                }
+            }
+        }
+    }
+    let up = image::imageops::resize(&image::RgbaImage::from_raw(w, h, new[..4 * n].to_vec()).expect("size checked"), nw, nh, image::imageops::FilterType::Triangle).into_raw();
+    let mut out = pack[..4 * nw as usize * nh as usize].to_vec();
+    for y in 0..nh as usize {
+        let sy = y * hu / nh as usize;
+        for x in 0..nw as usize {
+            let sx = x * wu / nw as usize;
+            if near[sy * wu + sx] {
+                let k = (y * nw as usize + x) * 4;
+                out[k..k + 4].copy_from_slice(&up[k..k + 4]);
+            }
+        }
+    }
+    Replaced { width: nw, height: nh, mips: build_mips(nw, nh, out, count) }
+}
+
 /// The on-device enhancer: 2× premultiplied Lanczos-3 over a wrapped border (most game textures
 /// tile), then contrast-adaptive sharpening of the colour.
 pub(crate) fn enhance2x(w: u32, h: u32, px: &[u8]) -> Vec<u8> {
@@ -342,6 +381,26 @@ mod tests {
         assert_eq!(hash_of_name(&format!("{:016x}.png", texture_hash(8, 8, &px))), Some(texture_hash(8, 8, &px)));
         assert_eq!(hash_of_name("0123456789ABCDEF.PNG"), Some(0x0123_4567_89AB_CDEF));
         assert_eq!(hash_of_name("readme.png"), None);
+    }
+
+    #[test]
+    fn composite_keeps_the_pack_where_the_page_did_not_change() {
+        // a 16×16 grey page, its 32×32 replacement white; a dent darkens one texel
+        let orig = vec![128u8; 16 * 16 * 4];
+        let pack = vec![255u8; 32 * 32 * 4];
+        let mut new = orig.clone();
+        new[(5 * 16 + 5) * 4..(5 * 16 + 5) * 4 + 3].copy_from_slice(&[0, 0, 0]);
+        let r = composite(16, 16, &orig, &new, &pack, 32, 32, 2);
+        assert_eq!((r.width, r.height, r.mips.len()), (32, 32, 2));
+        let at = |x: usize, y: usize| r.mips[0][(y * 32 + x) * 4];
+        assert_eq!(at(0, 0), 255);
+        assert_eq!(at(31, 31), 255);
+        assert!(at(10, 10) < 128);
+        // the dent's neighbour is scaled up too, not the pack's white
+        assert!(at(8, 10) <= 128);
+        // nothing changed: the pack as it is
+        let same = composite(16, 16, &orig, &orig, &pack, 32, 32, 1);
+        assert!(same.mips[0].iter().all(|&v| v == 255));
     }
 
     #[test]

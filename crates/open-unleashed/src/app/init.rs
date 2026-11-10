@@ -386,6 +386,7 @@ impl App {
             autotest,
             fe_rng: nfs_game::opponents::FeRng::new(0),
             race_pass: false,
+            race_mark: None,
             session_races: std::env::var("NFS_AUTOTEST_RACES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1),
             session_replayed: false,
             intro: None,

@@ -114,6 +114,12 @@ impl NetPlay {
         self.picture_of(r, id).map(|(t, _, _)| t)
     }
 
+    /// Forget the pictures uploaded after `mark`, which the renderer is giving back (the race's end):
+    /// they are uploaded again when next asked for.
+    pub fn forget_pictures_since(&mut self, mark: &nfs_renderer::ResourceMark) {
+        self.pictures.retain(|_, t| !t.is_some_and(|(t, _, _)| mark.covers(t)));
+    }
+
     /// The picture of player `id` once its file is whole, uploaded once: texture, width, height
     /// (0x4903F0 finds the file of type 0, 0x428772 / 0x4A51F5 test `+0xC >= +8`).
     pub fn picture_of(&mut self, r: &mut Renderer, id: i32) -> Option<(TextureId, u32, u32)> {

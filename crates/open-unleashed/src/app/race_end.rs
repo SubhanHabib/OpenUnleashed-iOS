@@ -402,6 +402,26 @@ impl App {
     /// models and sky dropped (0x4690F0 undoes the track load — the weather 0x458BB0, the sky
     /// 0x45DD10 among it —, 0x414F80 the race's init, 0x471C40 deletes the camera manager) and the
     /// HUD torn down (0x425330 at 0x4B6A23).
+    /// PORT-DEVIATION (memory, no counterpart in the game): give back the GPU memory of what the race
+    /// loaded since [`App::race_mark`] — the track, the cars, the sky, the HUD, the loading screen's
+    /// art, the mirror's target — as the original freed them with the race. The port's one renderer
+    /// outlives the race, and kept them all: about 300 MB a race with an upscaled texture pack, which
+    /// ran an iPhone out of memory after a few races. What outlives the race and holds an id from
+    /// it is dropped here too, and made again when next needed.
+    pub(crate) fn release_race_resources(&mut self, r: &mut Renderer) {
+        let Some(mark) = self.race_mark.take() else { return };
+        r.release_since(mark);
+        self.mirror_tex = self.mirror_tex.filter(|t| !mark.covers(*t));
+        // the car shadow pools grow while racing and are not remade per race
+        for pool in &mut self.shadow_meshes {
+            pool.retain(|m| !mark.covers_mesh(*m));
+        }
+        self.fe.race_loading = None;
+        if let Some(n) = self.net.session.as_mut() {
+            n.forget_pictures_since(&mark);
+        }
+    }
+
     pub(crate) fn sim_shutdown(&mut self) {
         // an input-exchange race's player reports `0xB7 (−2, −1)` to the room as it leaves (0x48DA60)
         if let Some(n) = self.net.session.as_mut() {
@@ -418,6 +438,10 @@ impl App {
         self.sky = None;
         self.scene = Scene::default();
         self.hud_teardown();
+        if let Some(mut r) = self.renderer.take() {
+            self.release_race_resources(&mut r);
+            self.renderer = Some(r);
+        }
     }
 
     /// **The HUD torn down — 0x425330**, from the sim shutdown 0x4B68F0 (0x4B6A23), which runs only

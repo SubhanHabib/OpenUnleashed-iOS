@@ -44,6 +44,31 @@ struct FrameOpts {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaterialId(pub(crate) u32);
 
+/// PORT-DEVIATION (memory, no counterpart in the game): how far the renderer's tables of textures,
+/// materials and meshes reached at a point in time ([`crate::Renderer::mark`]). Everything made after
+/// it can be given back at once ([`crate::Renderer::release_since`]) — what a race loaded, when the
+/// race ends. The original freed its track, cars and sky with them (the sim shutdown 0x4B68F0); the
+/// port's renderer outlives a race and kept every upload, about 300 MB of GPU memory a race with an
+/// upscaled texture pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceMark {
+    pub(crate) textures: u32,
+    pub(crate) materials: u32,
+    pub(crate) meshes: u32,
+}
+
+impl ResourceMark {
+    /// `t` was made after the mark, so [`crate::Renderer::release_since`] gives it back.
+    pub fn covers(&self, t: TextureId) -> bool {
+        t.0 >= self.textures
+    }
+
+    /// `m` was made after the mark, so [`crate::Renderer::release_since`] gives it back.
+    pub fn covers_mesh(&self, m: MeshId) -> bool {
+        m.0 >= self.meshes
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsUniform {
@@ -114,6 +139,8 @@ struct GpuMesh {
     /// `update_mesh_vertices` that queued bytes): lets a caller that keeps the last vertices it
     /// wrote tell whether anyone else wrote the mesh since ([`Core::mesh_writes`]).
     writes: u32,
+    /// given back ([`Core::release_since`]): its buffers are an empty pair and it draws nothing
+    released: bool,
 }
 
 /// The arena the static meshes are carved from: a vertex and an index buffer, filled front to back.
@@ -147,6 +174,9 @@ struct GpuTexture {
     /// A replaced texture's original level 0, and the replacement's level 0 once the game first
     /// rewrote it (a car's damage, `texpack::composite`)
     replaced_src: Option<Box<ReplacedSrc>>,
+    /// given back ([`Core::release_since`]): the slot holds the white texture, so a stale id draws
+    /// white instead of failing, and takes no writes
+    released: bool,
 }
 
 /// A texture's `(width, height, levels)`.
@@ -198,6 +228,8 @@ struct GpuMaterial {
     texture: TextureId,
     /// the specular map
     env: TextureId,
+    /// given back ([`Core::release_since`]): bound to the white texture alone
+    released: bool,
 }
 
 pub(crate) struct Core {
@@ -303,6 +335,9 @@ pub(crate) struct Core {
     /// submission of the frame being built ([`Self::frame_begin`])
     frames_in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
     last_submit: Option<wgpu::SubmissionIndex>,
+    /// how many times something given back ([`Self::release_since`]) was used since: each is a
+    /// caller that kept an id past its race (logged, the first few)
+    stale_uses: std::sync::atomic::AtomicU32,
 }
 
 /// At most this many frames are queued to the GPU ahead of the one being built (host pacing, no
@@ -1040,6 +1075,7 @@ impl Core {
             sprite_scratch: Vec::new(),
             frames_in_flight: std::collections::VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
             last_submit: None,
+            stale_uses: std::sync::atomic::AtomicU32::new(0),
         };
         let _ = &r.object_layout;
         r.white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
@@ -1094,6 +1130,7 @@ impl Core {
                 Cmd::DynamicMesh(m) => {
                     self.upload_dynamic_mesh(&m);
                 }
+                Cmd::Release(m) => self.release_since(m),
                 Cmd::Offscreen(j) => {
                     let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
@@ -1134,6 +1171,84 @@ impl Core {
     }
     pub(crate) fn offscreen_sizes(&self) -> std::collections::HashMap<u32, (u32, u32)> {
         self.offscreen.clone()
+    }
+
+    /// Give back every texture, material and mesh made after `m`. The ids stay: their slots keep a
+    /// stand-in (the white texture, a material on it, a mesh that draws nothing), so the ids handed
+    /// out later go on from the end and the front's offscreen ids still match. A stale id draws
+    /// white or nothing and is logged ([`Self::note_stale`]). wgpu keeps what a frame still in flight
+    /// uses alive until the GPU is done with it.
+    pub(crate) fn release_since(&mut self, m: ResourceMark) {
+        let (t0, m0, g0) = (m.textures as usize, m.materials as usize, m.meshes as usize);
+        let white = self.white;
+        let (wt, wv, wbg) = {
+            let w = &self.textures[white.0 as usize];
+            (w._texture.clone(), w.view.clone(), w.sprite_bg.clone())
+        };
+        let mut bytes = 0u64;
+        let mut textures = 0u32;
+        for t in self.textures.iter_mut().skip(t0).filter(|t| !t.released) {
+            let size = t._texture.size();
+            bytes += (0..t._texture.mip_level_count()).map(|l| u64::from((size.width >> l).max(1)) * u64::from((size.height >> l).max(1)) * 4).sum::<u64>();
+            *t = GpuTexture { _texture: wt.clone(), view: wv.clone(), sprite_bg: wbg.clone(), replaced: None, replaced_src: None, released: true };
+            textures += 1;
+        }
+        self.offscreen.retain(|&i, _| (i as usize) < t0);
+        for b in self.sky_bgs.iter_mut().skip(t0) {
+            *b = None;
+        }
+        self.pending_textures.retain(|w| (w.texture as usize) < t0);
+        let stale = |t: Option<TextureId>| t.filter(|t| (t.0 as usize) < t0);
+        if stale(self.proj_tex) != self.proj_tex || stale(self.head_tex) != self.head_tex {
+            self.proj_tex = stale(self.proj_tex);
+            self.head_tex = stale(self.head_tex);
+            self.rebuild_globals_bg();
+        }
+        let mut materials = 0u32;
+        for i in m0..self.materials.len() {
+            if self.materials[i].released {
+                continue;
+            }
+            let (sampler, false_sort) = (self.materials[i].sampler, self.materials[i].false_sort);
+            let bind_group = self.material_bind_group(white, sampler, white);
+            let bind_group_point = false_sort.then(|| self.material_bind_group_point(white, sampler, white));
+            let mat = &mut self.materials[i];
+            (mat.bind_group, mat.bind_group_point) = (bind_group, bind_group_point);
+            (mat.texture, mat.env, mat.env_mix, mat.sky_map, mat.released) = (white, white, 0.0, false, true);
+            materials += 1;
+        }
+        let mut meshes = 0u32;
+        if self.meshes.len() > g0 {
+            // what is left of the arena goes too: the next mesh starts a fresh one (a mesh from before
+            // the mark that shares it keeps it alive), sealed first so those draw from it
+            self.seal_arena();
+            self.arena = None;
+            let empty = |label: &'static str, usage: wgpu::BufferUsages| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: VERTEX_STRIDE, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let (vb, ib) = (empty("released mesh vb", wgpu::BufferUsages::VERTEX), empty("released mesh ib", wgpu::BufferUsages::INDEX));
+            let serial = self.buffer_serial;
+            self.buffer_serial += 1;
+            for g in self.meshes.iter_mut().skip(g0).filter(|g| !g.released) {
+                bytes += g.vertex_len + g.index_len;
+                *g = GpuMesh { vertex_buf: vb.clone(), vertex_offset: 0, vertex_len: VERTEX_STRIDE, index_buf: ib.clone(), index_offset: 0, index_len: VERTEX_STRIDE, index_count: 0, vb_serial: serial, ib_serial: serial, writes: g.writes, released: true };
+                meshes += 1;
+            }
+            self.pending_writes.retain(|w| (w.mesh as usize) < g0);
+        }
+        tracing::info!(textures, materials, meshes, mb = bytes / (1 << 20), "renderer: resources given back");
+    }
+
+    /// A caller used a texture, material or mesh given back ([`Self::release_since`]): it draws
+    /// white or nothing. Logged the first few times, as a bug in who keeps the id.
+    fn note_stale(&self, what: &'static str, id: u32) {
+        let n = self.stale_uses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            tracing::warn!(what, id, "renderer: a released resource used");
+        }
+    }
+
+    /// How many uses of released resources [`Self::note_stale`] has seen.
+    pub(crate) fn stale_uses(&self) -> u32 {
+        self.stale_uses.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Let the surface be copied from, for the lens flare's frame read-back. Off (the default) the
@@ -1266,7 +1381,7 @@ impl Core {
         let (vertex_len, index_len) = (vertex_buf.size(), index_buf.size());
         let serial = self.buffer_serial;
         self.buffer_serial += 1;
-        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0 });
+        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0, released: false });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -1340,7 +1455,7 @@ impl Core {
         }
         a.vertex_used += vreserve;
         a.index_used += ireserve;
-        self.meshes.push(GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0 });
+        self.meshes.push(GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, vb_serial: a.serial, ib_serial: a.serial, writes: 0, released: false });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
@@ -1429,7 +1544,7 @@ impl Core {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sprite_sampler) }],
         }));
         tracing::debug!(w = width, h = height, "texture uploaded");
-        GpuTexture { _texture: texture, view, sprite_bg, replaced, replaced_src }
+        GpuTexture { _texture: texture, view, sprite_bg, replaced, replaced_src, released: false }
     }
 
 
@@ -1437,6 +1552,11 @@ impl Core {
     /// rest is ignored; less and the level is skipped).
     pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
         let Some(tex) = self.textures.get_mut(id.0 as usize) else { return };
+        if tex.released {
+            // (the slot's texture is the white one, which must not change)
+            self.note_stale("texture write", id.0);
+            return;
+        }
         // a replaced texture (`texpack`) takes the new pixels replaced again; else the replacement where
         // the new pixels are the original's and the new ones scaled up where they changed (a car's
         // damage, `texpack::composite`); its levels rebuilt from the new top level (the original's lower
@@ -1531,6 +1651,11 @@ impl Core {
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
         let texture = desc.texture.unwrap_or(self.white);
         let env = desc.env_texture.unwrap_or(self.white);
+        for t in [texture, env] {
+            if self.textures.get(t.0 as usize).is_some_and(|t| t.released) {
+                self.note_stale("material texture", t.0);
+            }
+        }
         let sampler = desc.clamp[0] as usize | (desc.clamp[1] as usize) << 1;
         let bind_group = self.material_bind_group(texture, sampler, env);
         let bind_group_point = desc.false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
@@ -1552,6 +1677,7 @@ impl Core {
             sky_map: desc.sky_map,
             texture,
             env,
+            released: false,
         });
         MaterialId(self.materials.len() as u32 - 1)
     }
@@ -1564,6 +1690,9 @@ impl Core {
     /// synchronous blit 0x572B40).
     pub fn duplicate_material_texture(&mut self, id: MaterialId, texture: TextureId) -> MaterialId {
         let Some(m) = self.materials.get(id.0 as usize) else { return id };
+        if m.released || self.textures.get(texture.0 as usize).is_some_and(|t| t.released) {
+            self.note_stale("duplicated material", id.0);
+        }
         let (sampler, env, false_sort) = (m.sampler, m.env, m.false_sort);
         let (alpha_blend, blend_pair, device_states, lod_bias, cull_back, view_cull, depth_bias, depth_test, env_mix, env_variant, sky_map) =
             (m.alpha_blend, m.blend_pair, m.device_states, m.lod_bias, m.cull_back, m.view_cull, m.depth_bias, m.depth_test, m.env_mix, m.env_variant, m.sky_map);
@@ -1587,6 +1716,7 @@ impl Core {
             sky_map,
             texture,
             env,
+            released: false,
         });
         MaterialId(self.materials.len() as u32 - 1)
     }
@@ -1803,7 +1933,7 @@ impl Core {
                     layout: &self.sprite_layout,
                     entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
                 }));
-                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, replaced: None, replaced_src: None });
+                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg, replaced: None, replaced_src: None, released: false });
                 let id = TextureId(self.textures.len() as u32 - 1);
                 self.offscreen.insert(id.0, (width, height));
                 id
@@ -1896,6 +2026,12 @@ impl Core {
         for &idx in bucket {
             let item = &scene.items[idx as usize];
             let mat = &self.materials[item.material.0 as usize];
+            if mat.released || self.meshes[item.mesh.0 as usize].released {
+                self.note_stale(if mat.released { "material" } else { "mesh" }, if mat.released { item.material.0 } else { item.mesh.0 });
+                if self.meshes[item.mesh.0 as usize].released {
+                    continue;
+                }
+            }
             // mirrored world: the winding flips, so a material whose cull is the view's culls
             // the other one (0x468C45); any other draws both faces rather than the wrong one
             let cull = match (mat.cull_back, scene.mirror != item.mirrored, mat.view_cull) {
@@ -2258,7 +2394,11 @@ impl Core {
                 pass.draw((first * 6) as u32..(end * 6) as u32, 0..1);
             };
             for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
-                if self.textures[sp.texture.0 as usize].sprite_bg.is_none() {
+                let t = &self.textures[sp.texture.0 as usize];
+                if t.released {
+                    self.note_stale("sprite texture", sp.texture.0);
+                }
+                if t.sprite_bg.is_none() {
                     continue;
                 }
                 let pipeline = sp.depth.map(|d| d.compare);

@@ -17,7 +17,7 @@
 //! and the read-backs (`render_to_image`) are the one thing that does: they need
 //! the core in hand, so they first take it back (waiting for the frame in flight) and run the list.
 
-use crate::gpu::{Core, MaterialId, MeshId, OffscreenSpec, TextureId};
+use crate::gpu::{Core, MaterialId, MeshId, OffscreenSpec, ResourceMark, TextureId};
 use crate::{Camera, FakeSortMode, LensRead, MaterialDesc, MeshData, Scene, TextureData, Vertex};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -44,6 +44,8 @@ pub(crate) enum Cmd {
     DuplicateMaterial { id: MaterialId, texture: TextureId },
     DynamicMesh(Box<MeshData>),
     Offscreen(Box<OffscreenJob>),
+    /// [`Renderer::release_since`]
+    Release(ResourceMark),
 }
 
 pub(crate) struct OffscreenJob {
@@ -468,6 +470,35 @@ impl Renderer {
         self.list.cmds.push(Cmd::Offscreen(Box::new(OffscreenJob { scene: scene.clone_without_sprites(), camera: *camera, width, height, reuse, clear: clear_colour, depth_far, id })));
         self.list.barrier = self.list.cmds.len();
         id
+    }
+
+    /// PORT-DEVIATION (memory): the point to give back to — every texture, material and mesh made
+    /// from here on goes at [`Self::release_since`] (`ResourceMark`).
+    pub fn mark(&self) -> ResourceMark {
+        ResourceMark { textures: self.n_textures, materials: self.material_tex.len() as u32, meshes: self.meshes.len() as u32 }
+    }
+
+    /// Give back the GPU memory of every texture (offscreen targets included), material and mesh made
+    /// since `mark`. Their ids stay taken and draw white or nothing from here (a use is logged, as a
+    /// caller that kept one too long); ids handed out later go on from the end. Recorded in the
+    /// command list like any change, so a frame in flight still draws with them.
+    pub fn release_since(&mut self, mark: ResourceMark) {
+        let white = self.white;
+        for t in self.material_tex.iter_mut().skip(mark.materials as usize) {
+            *t = white;
+        }
+        // a released mesh takes no vertex writes
+        for m in self.meshes.iter_mut().skip(mark.meshes as usize) {
+            m.vertex_len = 0;
+        }
+        self.offscreen.retain(|&i, _| i < mark.textures);
+        self.list.cmds.push(Cmd::Release(mark));
+        self.list.barrier = self.list.cmds.len();
+    }
+
+    /// How many times something given back by [`Self::release_since`] was used since (tests and logs).
+    pub fn stale_uses(&mut self) -> u32 {
+        self.home().stale_uses()
     }
 
     pub fn render_to_image(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {

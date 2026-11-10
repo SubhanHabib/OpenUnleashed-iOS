@@ -44,7 +44,7 @@ pub use texpack::{set_texture_dump, set_texture_enhance, set_texture_pack, textu
 
 pub use camera::Camera;
 pub use front::Renderer;
-pub use gpu::{MaterialId, MeshId, OffscreenSpec, STILL_MAX_PIXELS, TextureId, VIEW_FAR, still_size};
+pub use gpu::{MaterialId, MeshId, OffscreenSpec, ResourceMark, STILL_MAX_PIXELS, TextureId, VIEW_FAR, still_size};
 
 use glam::{Mat4, Vec3};
 

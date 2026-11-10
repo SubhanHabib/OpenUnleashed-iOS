@@ -425,6 +425,10 @@ pub(crate) struct App {
     /// The next `start_race` is another pass of the session loop (0x4B6D9F: "race again", the
     /// automatic replay), not a new session's race load 0x4B67B0.
     pub(crate) race_pass: bool,
+    /// PORT-DEVIATION (memory): the renderer's tables as the race load began
+    /// ([`nfs_renderer::Renderer::mark`]); what the race made after it is given back as it ends
+    /// ([`App::release_race_resources`])
+    pub(crate) race_mark: Option<nfs_renderer::ResourceMark>,
     /// diagnostic: `NFS_AUTOTEST_RACES=n` — a scripted session of `n` races, each `--autotest`
     /// seconds long: race → the automatic replay over it → leave → the next race (the session
     /// loop 0x4B6D88 and the front end's round trip), so the second race's `--record` rows can be

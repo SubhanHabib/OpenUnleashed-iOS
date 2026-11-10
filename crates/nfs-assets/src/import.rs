@@ -70,6 +70,8 @@ pub enum ImportError {
     Io { path: PathBuf, #[source] source: io::Error },
     #[error("{path}: not a readable .zip ({msg})")]
     Zip { path: PathBuf, msg: String },
+    #[error("no texture pack in {0}: a pack is PNG files named after the texture they replace (16 hex digits and .png)")]
+    NoPack(PathBuf),
     #[error("import cancelled")]
     Cancelled,
 }
@@ -529,6 +531,168 @@ pub fn unzip_folder(zip_path: &Path, dest: &Path, is_key: impl Fn(&str) -> bool)
             let _ = std::fs::remove_dir_all(&staging);
             Err(e)
         }
+    }
+}
+
+/// `0123456789abcdef.png` (any case): the name of a texture-pack file.
+pub fn is_pack_texture(name: &str) -> bool {
+    name.len() == 20 && name[16..].eq_ignore_ascii_case(".png") && name.as_bytes()[..16].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// The folder name a pack imported from `src` gets: its file or folder name without `.zip`, without a leading `_` or
+/// `.` (the pack loader skips such folders), `pack` when nothing is left.
+pub fn pack_name(src: &Path) -> String {
+    let n = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let n = if n.len() >= 4 && n.is_char_boundary(n.len() - 4) && n[n.len() - 4..].eq_ignore_ascii_case(".zip") { &n[..n.len() - 4] } else { &n[..] };
+    let n = n.trim_start_matches(['_', '.']).trim();
+    if n.is_empty() { "pack".into() } else { n.replace(['/', '\\', ':'], "-") }
+}
+
+/// PLATFORM GLUE (iOS texture packs): the pack at `src` (a `.zip` or a folder) into `textures/<pack_name>`, replacing
+/// a pack of that name. Only texture files ([`is_pack_texture`]) are taken, from anywhere in it, into one folder;
+/// when two have the same name, the one whose path sorts first wins. Folders whose name starts with `_` or `.`
+/// are skipped, as the pack loader skips them. Everything goes into a `_`-named staging folder first, so a failed
+/// import leaves the old pack as it was. The pack's folder name and the number of textures.
+#[cfg(feature = "import")]
+pub fn import_texture_pack(src: &Path, textures: &Path, progress: &Progress) -> Result<(String, usize), ImportError> {
+    use std::collections::BTreeMap;
+    let name = pack_name(src);
+    let dest = textures.join(&name);
+    let staging = textures.join(format!("_importing {name}"));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(io_at(&staging))?;
+    let skipped = |c: &str| is_junk(c) || c.starts_with('_') || c.starts_with('.');
+    let r = (|| {
+        let mut n = 0;
+        if src.is_dir() {
+            progress.set_stage("Looking for textures");
+            // file name (lower case) -> the source path that sorts first
+            let mut found: BTreeMap<String, PathBuf> = BTreeMap::new();
+            let mut stack = vec![(src.to_path_buf(), 0)];
+            while let Some((d, depth)) = stack.pop() {
+                for e in std::fs::read_dir(&d).map_err(io_at(&d))?.flatten() {
+                    let p = e.path();
+                    let fname = e.file_name().to_string_lossy().into_owned();
+                    if p.is_dir() {
+                        if depth < 6 && !skipped(&fname) {
+                            stack.push((p, depth + 1));
+                        }
+                    } else if is_pack_texture(&fname) {
+                        let k = fname.to_ascii_lowercase();
+                        if found.get(&k).is_none_or(|old| p < *old) {
+                            found.insert(k, p);
+                        }
+                    }
+                }
+            }
+            progress.total.store(found.len() as u64, Ordering::Relaxed);
+            for (k, p) in &found {
+                progress.check_cancel().map_err(io_at(p))?;
+                let out = staging.join(k);
+                std::fs::copy(p, &out).map_err(io_at(p))?;
+                n += 1;
+                progress.done.store(n as u64, Ordering::Relaxed);
+            }
+        } else {
+            let zerr = |e: zip::result::ZipError| ImportError::Zip { path: src.to_path_buf(), msg: e.to_string() };
+            progress.set_stage("Reading the archive");
+            let file = std::fs::File::open(src).map_err(io_at(src))?;
+            let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(zerr)?;
+            // file name (lower case) -> (entry path, entry index), the path that sorts first
+            let mut found: BTreeMap<String, (PathBuf, usize)> = BTreeMap::new();
+            for i in 0..zip.len() {
+                let e = zip.by_index_raw(i).map_err(zerr)?;
+                let Some(p) = e.enclosed_name() else { continue };
+                if e.is_dir() {
+                    continue;
+                }
+                let Some(fname) = p.file_name().map(|f| f.to_string_lossy().into_owned()) else { continue };
+                let parents_ok = p.parent().is_none_or(|d| d.components().all(|c| !skipped(&c.as_os_str().to_string_lossy())));
+                if !parents_ok || !is_pack_texture(&fname) {
+                    continue;
+                }
+                let k = fname.to_ascii_lowercase();
+                if found.get(&k).is_none_or(|(old, _)| p < *old) {
+                    found.insert(k, (p, i));
+                }
+            }
+            progress.total.store(found.len() as u64, Ordering::Relaxed);
+            for (k, (_, i)) in &found {
+                let out = staging.join(k);
+                progress.check_cancel().map_err(io_at(&out))?;
+                let mut e = zip.by_index(*i).map_err(zerr)?;
+                let mut f = std::fs::File::create(&out).map_err(io_at(&out))?;
+                io::copy(&mut e, &mut f).map_err(io_at(&out))?;
+                n += 1;
+                progress.done.store(n as u64, Ordering::Relaxed);
+            }
+        }
+        if n == 0 {
+            return Err(ImportError::NoPack(src.to_path_buf()));
+        }
+        Ok(n)
+    })();
+    match r {
+        Ok(n) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            std::fs::rename(&staging, &dest).map_err(io_at(&dest))?;
+            Ok((name, n))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "import"))]
+mod pack_tests {
+    use super::*;
+
+    #[test]
+    fn pack_names() {
+        assert!(is_pack_texture("0123456789abcdef.png") && is_pack_texture("0123456789ABCDEF.PNG"));
+        assert!(!is_pack_texture("0123456789abcdeg.png") && !is_pack_texture("README.txt") && !is_pack_texture("123.png"));
+        assert_eq!(pack_name(Path::new("/x/esrgan.zip")), "esrgan");
+        assert_eq!(pack_name(Path::new("/x/_dump")), "dump");
+        assert_eq!(pack_name(Path::new("/x/.zip")), "pack");
+    }
+
+    #[test]
+    fn a_pack_imports_from_a_zip_and_a_folder() {
+        let base = std::env::temp_dir().join(format!("ou-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("My Pack");
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::create_dir_all(src.join("_skip")).unwrap();
+        std::fs::write(src.join("0000000000000001.png"), b"one").unwrap();
+        std::fs::write(src.join("a/b/0000000000000002.png"), b"two").unwrap();
+        std::fs::write(src.join("a/0000000000000002.png"), b"two-first").unwrap();
+        std::fs::write(src.join("_skip/0000000000000003.png"), b"skipped").unwrap();
+        std::fs::write(src.join("notes.txt"), b"x").unwrap();
+        let out = std::env::temp_dir().join(format!("ou-pack-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let tex = out.join("Textures");
+        std::fs::create_dir_all(&tex).unwrap();
+        let p = Progress::default();
+        assert_eq!(import_texture_pack(&src, &tex, &p).unwrap(), ("My Pack".into(), 2));
+        assert_eq!(std::fs::read(tex.join("My Pack/0000000000000002.png")).unwrap(), b"two-first");
+        assert!(!tex.join("My Pack/0000000000000003.png").exists() && !tex.join("My Pack/notes.txt").exists());
+        // the Files app's "Compress": the folder's name in front; it replaces the pack of the same name
+        let zip = out.join("My Pack.zip");
+        zip_folder(&base, &zip).unwrap();
+        std::fs::write(tex.join("My Pack/old.png"), b"old").unwrap();
+        let (name, n) = import_texture_pack(&zip, &tex, &p).unwrap();
+        assert_eq!((name.as_str(), n), ("My Pack", 2));
+        assert!(!tex.join("My Pack/old.png").exists());
+        assert_eq!(std::fs::read(tex.join("My Pack/0000000000000001.png")).unwrap(), b"one");
+        // no textures in it: an error, and the pack there stays
+        let empty = base.join("Empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(import_texture_pack(&empty, &tex, &p), Err(ImportError::NoPack(_))));
+        assert!(!tex.join("Empty").exists() && !tex.join("_importing Empty").exists());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
 

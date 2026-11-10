@@ -86,7 +86,7 @@ cat > "$PROJ/Info.plist" <<PLIST
   <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
   <key>UISupportedInterfaceOrientations~ipad</key>
   <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
-  <!-- the app's Documents in the Files app ("On My iPad > $APP_TITLE"): a game folder or .zip dropped there is
+  <!-- the app's Documents in the Files app ("On My iPhone / iPad > $APP_TITLE"): a game folder or .zip dropped there is
        imported at the next start; the log (Logs/) and the photo-mode stills (Photos/) are there too -->
   <key>UIFileSharingEnabled</key><true/>
   <key>LSSupportsOpeningDocumentsInPlace</key><true/>

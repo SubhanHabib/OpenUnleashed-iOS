@@ -34,7 +34,8 @@ fn intro() -> String {
         "This app contains no game data. To play, you need your own copy of Need for Speed: Porsche Unleashed (PC).\n\n\
          Choose the game's installed folder (the one with GameData and FEData in it), or a .zip of that folder. \
          It is copied into the app once; you can delete the original afterwards.\n\n\
-         You can also copy the folder or .zip into this app's folder in the Files app (On My iPad › {}), then open the app again.",
+         You can also copy the folder or .zip into this app's folder in the Files app ({} › {}), then open the app again.",
+        super::on_my_device(),
         crate::brand::TITLE
     )
 }

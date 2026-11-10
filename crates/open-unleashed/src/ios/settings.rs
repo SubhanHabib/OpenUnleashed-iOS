@@ -16,6 +16,9 @@
 //! The display and game options ([`GameOptions`]): the HUD kept inside the safe area, the render resolution, a frame
 //! cap, the weather fog, texture filtering, the intro movies and car-to-car collisions.
 //!
+//! **Import texture pack** takes a pack's `.zip` (or folder) from the Files app into `Documents/Textures/<name>`
+//! (`nfs_assets::import::import_texture_pack`), on its own thread; [`poll`] follows it between frames.
+//!
 //! The pad's own buttons stay what SDL reads; [`pad_filter`] rewrites the on-screen pad's snapshot to the chosen
 //! layout before the bindings see it, so the game's bindings (Options › Controls) are not touched.
 
@@ -25,7 +28,7 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{DefinedClass, Encode, Encoding, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString, NSURL};
-use objc2_uniform_type_identifiers::UTTypeZIP;
+use objc2_uniform_type_identifiers::{UTTypeFolder, UTTypeZIP};
 use objc2_ui_kit::{
     NSTextAlignment, UIButton, UIButtonConfiguration, UIButtonType, UIColor, UIControlEvents, UIFont, UILabel,
     UILayoutConstraintAxis, UIModalPresentationStyle, UIScrollView, UISegmentedControl, UISlider, UIStackView,
@@ -34,7 +37,7 @@ use objc2_ui_kit::{
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// What SDL calls `GCVirtualController`'s pad.
@@ -497,12 +500,31 @@ struct Controls {
     dump_textures: Retained<UISwitch>,
     haptics: Retained<UISwitch>,
     saves_status: Retained<UILabel>,
+    pack_button: Retained<UIButton>,
+    pack_status: Retained<UILabel>,
+    done: Retained<UIButton>,
+}
+
+/// What the document picker that is up was opened for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    ExportSaves,
+    ImportSaves,
+    TexturePack,
+}
+
+/// A texture pack import under way.
+struct PackJob {
+    progress: Arc<nfs_assets::import::Progress>,
+    handle: std::thread::JoinHandle<Result<(String, usize), String>>,
+    /// the picked URL, read in place: its security scope is held until the import ends
+    scoped: Option<Retained<NSURL>>,
 }
 
 pub struct Ivars {
     controls: RefCell<Option<Controls>>,
-    /// the document picker up is the save import's (not the export's)
-    importing: Cell<bool>,
+    picking: Cell<Pick>,
+    pack_job: RefCell<Option<PackJob>>,
     /// saves were imported: Done closes the app, which reads them at its next start
     restart: Cell<bool>,
 }
@@ -550,7 +572,7 @@ define_class!(
                         &NSArray::from_retained_slice(&[url]),
                         true,
                     );
-                    self.ivars().importing.set(false);
+                    self.ivars().picking.set(Pick::ExportSaves);
                     self.present_picker(&picker);
                 }
                 Err(e) => self.saves_status(&e),
@@ -568,7 +590,26 @@ define_class!(
                 true,
             );
             picker.setAllowsMultipleSelection(false);
-            self.ivars().importing.set(true);
+            self.ivars().picking.set(Pick::ImportSaves);
+            self.present_picker(&picker);
+        }
+
+        #[unsafe(method(importPack:))]
+        fn import_pack(&self, _sender: Option<&AnyObject>) {
+            if self.ivars().pack_job.borrow().is_some() {
+                return;
+            }
+            let mtm = self.mtm();
+            // SAFETY: the system type constants
+            let (zip, folder) = unsafe { (UTTypeZIP, UTTypeFolder) };
+            // read in place (a pack can be a gigabyte): no copy into the app first
+            let picker = UIDocumentPickerViewController::initForOpeningContentTypes_asCopy(
+                UIDocumentPickerViewController::alloc(mtm),
+                &NSArray::from_slice(&[zip, folder]),
+                false,
+            );
+            picker.setAllowsMultipleSelection(false);
+            self.ivars().picking.set(Pick::TexturePack);
             self.present_picker(&picker);
         }
     }
@@ -578,9 +619,18 @@ define_class!(
     unsafe impl UIDocumentPickerDelegate for Page {
         #[unsafe(method(documentPicker:didPickDocumentsAtURLs:))]
         fn did_pick(&self, _controller: &UIDocumentPickerViewController, urls: &NSArray<NSURL>) {
-            if !self.ivars().importing.get() {
-                self.saves_status("Saves exported.");
-                return;
+            match self.ivars().picking.get() {
+                Pick::ExportSaves => {
+                    self.saves_status("Saves exported.");
+                    return;
+                }
+                Pick::TexturePack => {
+                    if let Some(url) = urls.firstObject() {
+                        self.start_pack(url);
+                    }
+                    return;
+                }
+                Pick::ImportSaves => {}
             }
             let Some(path) = urls.firstObject().and_then(|u| u.path()) else { return };
             let path = PathBuf::from(path.to_string());
@@ -610,6 +660,113 @@ impl Page {
         let Some(c) = c.as_ref() else { return };
         picker.setDelegate(Some(ProtocolObject::from_ref(self)));
         c.vc.presentViewController_animated_completion(picker, true, None);
+    }
+
+    fn start_pack(&self, url: Retained<NSURL>) {
+        // SAFETY: plain Foundation calls on a URL the picker handed over
+        let scoped = unsafe { url.startAccessingSecurityScopedResource() };
+        let Some(src) = url.path().map(|p| PathBuf::from(p.to_string())) else {
+            if scoped {
+                // SAFETY: balances the start above
+                unsafe { url.stopAccessingSecurityScopedResource() };
+            }
+            self.pack_status("That location cannot be read.");
+            return;
+        };
+        let Some(textures) = nfs_assets::platform::documents_dir().map(|d| d.join("Textures")) else {
+            self.pack_status("The app's Textures folder is not available.");
+            return;
+        };
+        tracing::info!(src = %src.display(), scoped, "texture pack picked");
+        let progress = Arc::new(nfs_assets::import::Progress::default());
+        let p = progress.clone();
+        let spawned = std::thread::Builder::new().name("texture pack".into()).spawn(move || {
+            std::fs::create_dir_all(&textures).map_err(|e| e.to_string())?;
+            nfs_assets::import::import_texture_pack(&src, &textures, &p).map_err(|e| match e {
+                nfs_assets::import::ImportError::NoPack(_) => {
+                    "That holds no texture pack: no PNG files named after a texture (16 hex digits and .png) in it.".to_string()
+                }
+                e => e.to_string(),
+            })
+        });
+        match spawned {
+            Ok(handle) => {
+                *self.ivars().pack_job.borrow_mut() = Some(PackJob { progress, handle, scoped: scoped.then_some(url) });
+                self.set_pack_busy(true);
+                self.pack_status("Importing the texture pack…");
+            }
+            Err(e) => {
+                if scoped {
+                    // SAFETY: balances the start above
+                    unsafe { url.stopAccessingSecurityScopedResource() };
+                }
+                self.pack_status(&format!("The import could not start: {e}"));
+            }
+        }
+    }
+
+    /// One look at the pack import, between frames.
+    fn poll_pack(&self) {
+        let running = match self.ivars().pack_job.borrow().as_ref() {
+            None => return,
+            Some(job) => {
+                if !job.handle.is_finished() {
+                    let (d, t) = (job.progress.done.load(Ordering::Relaxed), job.progress.total.load(Ordering::Relaxed));
+                    if t > 0 {
+                        self.pack_status(&format!("Importing the texture pack… {d} of {t} textures"));
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if running {
+            return;
+        }
+        let Some(mut job) = self.ivars().pack_job.borrow_mut().take() else { return };
+        if let Some(url) = job.scoped.take() {
+            // SAFETY: balances the start in `start_pack`
+            unsafe { url.stopAccessingSecurityScopedResource() };
+        }
+        self.set_pack_busy(false);
+        match job.handle.join().unwrap_or_else(|_| Err("The import stopped with an error.".into())) {
+            Ok((name, n)) => {
+                // packs on, and the Textures folder read again for what loads from now on
+                if let Some(c) = self.ivars().controls.borrow().as_ref() {
+                    c.texture_packs.setOn(true);
+                }
+                if let Some((s, o)) = self.read() {
+                    store(s);
+                    store_options(o);
+                }
+                OPTIONS_CHANGED.store(true, Ordering::Relaxed);
+                self.pack_status(&format!(
+                    "Imported “{name}”: {n} textures, in Files › {} › Textures. The next race uses them; quit and reopen the app to see them in the menus too.",
+                    crate::brand::TITLE
+                ));
+                tracing::info!(name, textures = n, "texture pack imported");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "texture pack import failed");
+                self.pack_status(&e);
+            }
+        }
+    }
+
+    fn set_pack_busy(&self, busy: bool) {
+        if let Some(c) = self.ivars().controls.borrow().as_ref() {
+            c.pack_button.setEnabled(!busy);
+            // the page stays up until the import ends
+            c.done.setEnabled(!busy);
+        }
+    }
+
+    fn pack_status(&self, text: &str) {
+        if let Some(c) = self.ivars().controls.borrow().as_ref() {
+            c.pack_status.setText(Some(&NSString::from_str(text)));
+            c.pack_status.setHidden(false);
+        }
     }
 
     fn saves_status(&self, text: &str) {
@@ -659,13 +816,27 @@ impl Page {
     }
 }
 
+/// Follows a texture pack import on the page, if one is under way (called between frames).
+pub fn poll() {
+    PAGE.with(|p| {
+        if let Some(page) = p.borrow().as_ref() {
+            page.poll_pack();
+        }
+    });
+}
+
 /// Opens the page over `presenter`.
 pub fn present(presenter: &UIViewController) {
     if is_open() {
         return;
     }
     let mtm = MainThreadMarker::new().expect("main thread");
-    let page = Page::alloc(mtm).set_ivars(Ivars { controls: RefCell::new(None), importing: Cell::new(false), restart: Cell::new(false) });
+    let page = Page::alloc(mtm).set_ivars(Ivars {
+        controls: RefCell::new(None),
+        picking: Cell::new(Pick::ExportSaves),
+        pack_job: RefCell::new(None),
+        restart: Cell::new(false),
+    });
     // SAFETY: `NSObject`'s designated initialiser
     let page: Retained<Page> = unsafe { msg_send![super(page), init] };
     let s = current();
@@ -799,10 +970,13 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let (dump_row, dump_textures) = switch_row(mtm, page, "Save the game's textures to Textures/_dump (for pack makers)", o.dump_textures);
     let tex_note = label(
         mtm,
-        "A pack is a folder in Textures holding PNG files named after the texture they replace (the names Textures/_dump uses), at any size. Folders whose name starts with _ are skipped.",
+        "Import takes a pack's .zip (or folder) from Files. A pack is PNG files named after the texture they replace (the names Textures/_dump uses), at any size; you can also copy its folder into Textures yourself. Folders whose name starts with _ are skipped.",
         UIFont::systemFontOfSize(13.0),
         0.6,
     );
+    let pack_button = plain_button(mtm, page, "Import Texture Pack…", sel!(importPack:));
+    // empty (no height) until an import says something
+    let pack_status = label(mtm, "", UIFont::systemFontOfSize(14.0), 0.92);
     let ini_note = label(
         mtm,
         "Fog, smooth textures and the intro movies follow the game folder's nfs5.ini too: an option turned off there stays off.",
@@ -817,10 +991,11 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     // SAFETY: as in `segments`
     unsafe { done.addTarget_action_forControlEvents(Some(page), sel!(done:), UIControlEvents::TouchUpInside) };
 
-    let views: [&UIView; 38] = [
+    let views: [&UIView; 40] = [
         &title, &touch_h, &note, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
         &legend, &display_h, &resolution_l, &resolution, &frame_rate_l, &frame_rate, &safe_row, &fog_row, &filter_row, &game_h,
-        &movies_row, &col_row, &haptics_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &saves_h, &saves_note,
+        &movies_row, &col_row, &haptics_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &pack_button,
+        &pack_status, &saves_h, &saves_note,
         &saves_buttons, &saves_status, &ini_note, &done,
     ];
     let content = stack(mtm, &views, UILayoutConstraintAxis::Vertical, 12.0);
@@ -834,7 +1009,7 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     content.setCustomSpacing_afterView(20.0, &frame_rate);
     content.setCustomSpacing_afterView(32.0, &filter_row);
     content.setCustomSpacing_afterView(32.0, &haptics_row);
-    content.setCustomSpacing_afterView(32.0, &tex_note);
+    content.setCustomSpacing_afterView(32.0, &pack_status);
     content.setCustomSpacing_afterView(20.0, &saves_buttons);
     content.setCustomSpacing_afterView(20.0, &saves_status);
     content.setCustomSpacing_afterView(24.0, &ini_note);
@@ -886,6 +1061,9 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
         dump_textures,
         haptics,
         saves_status,
+        pack_button,
+        pack_status,
+        done,
     }
 }
 

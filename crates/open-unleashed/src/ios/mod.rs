@@ -5,7 +5,7 @@
 //! handler, and the game is built inside it:
 //!
 //! * **Booting**: a game folder or `.zip` the player dropped into the app's `Documents` (the Files app's
-//!   "On My iPad › Open Unleashed") is imported first. Otherwise, game data already imported
+//!   "On My iPhone / iPad › Open Unleashed") is imported first. Otherwise, game data already imported
 //!   (`Library/Application Support/game`) starts the game at once.
 //! * **Import** (`importer.rs`): a UIKit screen that asks for the installed game's folder or a `.zip` of it,
 //!   through the system document picker. It copies or unpacks the data into the app's own storage, then
@@ -262,6 +262,7 @@ impl ApplicationHandler for Root {
                         settings::present(&vc);
                     }
                 }
+                settings::poll();
                 if settings::take_changed() {
                     self.pad.rebuild();
                 }
@@ -332,5 +333,19 @@ look in Textures/_dump: every texture the game loads is saved there under its na
 you want to change into a pack folder and edit them. Folders whose name starts with _ (like
 _dump) are never read as packs.
 
+Instead of copying a folder here, you can also pick a pack's .zip (or folder) with Import Texture
+Pack in the settings page; it is unpacked into a folder here named after it.
+
 Packs and the texture options take hold from the next start of the app.
 ";
+
+/// The Files app's name for this device's own storage: "On My iPhone", or "On My iPad" on an iPad.
+pub(crate) fn on_my_device() -> &'static str {
+    let Some(cls) = objc2::runtime::AnyClass::get(c"UIDevice") else { return "On My iPhone" };
+    // SAFETY: UIKit's documented `+[UIDevice currentDevice]` and `-userInterfaceIdiom` (an `NSInteger`; 1 is the iPad)
+    let idiom: isize = unsafe {
+        let d: objc2::rc::Retained<objc2::runtime::AnyObject> = objc2::msg_send![cls, currentDevice];
+        objc2::msg_send![&*d, userInterfaceIdiom]
+    };
+    if idiom == 1 { "On My iPad" } else { "On My iPhone" }
+}

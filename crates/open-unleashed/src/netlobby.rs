@@ -495,7 +495,7 @@ impl App {
                     let _ = std::process::Command::new("open").arg(url).spawn();
                     #[cfg(windows)]
                     let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios", windows)))]
                     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 }
                 event_loop.exit();

@@ -6,5 +6,13 @@ license.workspace = true
 
 [dependencies]
 winit.workspace = true
-sdl3-sys.workspace = true
 tracing.workspace = true
+
+# PLATFORM GLUE: desktop SDL is built with no video subsystem; iOS needs SDL's UIKit glue linked (its GameController
+# joystick driver calls into it) and drops HIDAPI (its Bluetooth path would need a CoreBluetooth permission; the
+# GameController driver already takes the Xbox / PlayStation / Switch pads, rumble included)
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+sdl3-sys = { workspace = true, features = ["no-sdl-video"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+sdl3-sys = { workspace = true, features = ["no-sdl-hidapi"] }

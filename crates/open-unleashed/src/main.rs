@@ -31,6 +31,8 @@ mod hud;
 mod hud_str;
 mod hud_cfg;
 mod intro_run;
+#[cfg(target_os = "ios")]
+mod ios;
 mod netlobby;
 mod netplay;
 mod parts_shop;
@@ -63,6 +65,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+#[cfg_attr(target_os = "ios", allow(unused_imports))]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -80,7 +83,39 @@ fn main() {
 fn run() -> Result<()> {
     // PLATFORM GLUE: the start-up crash guard (`guard.rs`): a start after a crashed one asks for a plain GPU device
     guard::begin();
-    let paths = GamePaths::locate()?;
+    // PLATFORM GLUE: iOS owns its event loop from the first instant (UIApplicationMain) and may have to import the
+    // game data before the game can be built (`ios/mod.rs`)
+    #[cfg(target_os = "ios")]
+    return ios::run();
+    #[cfg(not(target_os = "ios"))]
+    {
+        let Some((mut app, Some(event_loop))) = prepare(GamePaths::locate()?, desktop_event_loop)? else { return Ok(()) };
+        event_loop.run_app(&mut app)?;
+        Ok(())
+    }
+}
+
+/// The desktop event loop, built where `prepare` asks for it (after the assets, before the front end).
+#[cfg(not(target_os = "ios"))]
+fn desktop_event_loop(scripted: bool) -> Result<Option<EventLoop<()>>> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    if scripted {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder.with_activation_policy(ActivationPolicy::Accessory).with_activate_ignoring_other_apps(false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = scripted;
+    let event_loop = builder.build()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    Ok(Some(event_loop))
+}
+
+/// Everything the game sets up before its event loop runs, from the located game data: the `App`, and the event
+/// loop `make_loop` builds (`None` where the caller already runs one: iOS). `Ok(None)`: a command-line run that has
+/// already done its work (`--net-browse`).
+pub(crate) fn prepare(paths: GamePaths, make_loop: impl FnOnce(bool) -> Result<Option<EventLoop<()>>>) -> Result<Option<(App, Option<EventLoop<()>>)>> {
     tracing::info!(root = %paths.root.display(), "located original game data");
     // the Verok patch's `nfs5.ini` (dll 0x100022B0): `Filtering=0` is the renderer's, before it is made
     nfs_renderer::set_point_filter(!paths.nfs5_ini().filtering);
@@ -372,15 +407,7 @@ fn run() -> Result<()> {
     }
     // Windows / Linux: no activation policy exists; the scripted window is created with
     // `with_active(false)` (see `resumed`), which is the nearest no-focus behaviour winit offers.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut builder = EventLoop::builder();
-    #[cfg(target_os = "macos")]
-    if scripted {
-        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        builder.with_activation_policy(ActivationPolicy::Accessory).with_activate_ignoring_other_apps(false);
-    }
-    let event_loop = builder.build()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let event_loop = make_loop(scripted)?;
     // `--fe` boots into the original front end instead of the text menu, on the quick-race screen
     // or on the layout named after it (`--fe carcompare`)
     let fe_start = cli.fe.clone();
@@ -595,7 +622,7 @@ fn run() -> Result<()> {
         for g in &games {
             println!("  {}   {}/{}   {}   ping {}", g.name, g.players, g.limit, g.addr, g.ping.map_or("-".to_string(), |p| p.to_string()));
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // `--net host[:PORT]` / `--net join:HOST[:PORT]`: two copies of the port in one race.
@@ -775,8 +802,7 @@ fn run() -> Result<()> {
     // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550), the `.Max` clamped to the
     // range's last index 127 by `SetSelection` 0x4BC240
     app.input.axis_bands = [[0, 127]; 8];
-    event_loop.run_app(&mut app)?;
-    Ok(())
+    Ok(Some((app, event_loop)))
 }
 
 

@@ -4,6 +4,7 @@
 //! the engine's data types; everything above it (renderer, physics, game) consumes the converted
 //! structures.
 pub mod car;
+pub mod import;
 pub mod mesh;
 pub mod paths;
 pub mod platform;

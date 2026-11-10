@@ -597,6 +597,11 @@ impl ApplicationHandler for App {
                     let (ox, oy) = Hud::origin();
                     Some(((position.x / scale) as f32 - ox, (position.y / scale) as f32 - oy))
                 } else { self.window.as_ref().map(|w| {
+                    // PLATFORM GLUE (iOS): winit's `inner_size` there is the safe area, while the game draws
+                    // over the whole view (the size `Resized` gives) and touches are in the whole view's pixels
+                    #[cfg(target_os = "ios")]
+                    let size = w.outer_size();
+                    #[cfg(not(target_os = "ios"))]
                     let size = w.inner_size();
                     let (sw, sh) = (size.width.max(1) as f32, size.height.max(1) as f32);
                     let (u, v) = (position.x as f32 / sw, position.y as f32 / sh);

@@ -27,6 +27,17 @@ nfs-math.workspace = true
 image.workspace = true
 nfs-audio.workspace = true
 
+# PLATFORM GLUE (iOS): the game-data import screen (UIKit, the document picker), the on-screen controller
+# (GameController's `GCVirtualController`) and the window's UIKit view (`raw-window-handle`)
+[target.'cfg(target_os = "ios")'.dependencies]
+nfs-assets = { workspace = true, features = ["import"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray", "NSError", "NSObject", "NSValue", "NSSet", "NSDictionary"] }
+objc2-ui-kit = { version = "0.3", features = ["UIView", "UIViewController", "UIWindow", "UIResponder", "UILabel", "UIButton", "UIControl", "UIProgressView", "UIColor", "UIFont", "UIStackView", "UIDocumentPickerViewController", "UIApplication", "UIScreen", "NSLayoutConstraint", "NSLayoutAnchor", "UILayoutGuide", "NSText", "UIButtonConfiguration", "UIActivityIndicatorView", "UIScrollView", "UISegmentedControl", "UISwitch", "UISlider", "objc2-uniform-type-identifiers", "block2"] }
+objc2-uniform-type-identifiers = { version = "0.3", features = ["UTType", "UTCoreTypes"] }
+block2 = "0.6"
+raw-window-handle = "0.6"
+
 [build-dependencies]
 embed-resource = "3"
 

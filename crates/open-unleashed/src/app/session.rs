@@ -35,6 +35,9 @@ impl App {
                     // run's window from popping up in front of the user (a report of
                     // 2026-09-29: the `NFS_PLAY_INTRO=1` walk left one up ~10s).
                     .with_visible(!scripted);
+                // PLATFORM GLUE (iOS): full screen in landscape, no status bar or home indicator
+                #[cfg(target_os = "ios")]
+                let attrs = crate::ios::touch::window_attributes(attrs);
                 let window = Arc::new(event_loop.create_window(attrs).expect("window"));
                 let renderer = Renderer::new(window.clone()).expect("renderer");
                 (window, renderer)

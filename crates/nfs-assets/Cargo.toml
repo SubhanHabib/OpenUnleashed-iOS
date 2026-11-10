@@ -11,6 +11,11 @@ tracing.workspace = true
 nfs-renderer.workspace = true
 glam.workspace = true
 nfs-physics.workspace = true
+# PLATFORM GLUE (`import`, iOS): unpacking a `.zip` of the player's game folder; pure Rust (deflate via miniz_oxide)
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+
+[features]
+import = ["dep:zip"]
 
 [dev-dependencies]
 # `examples/fshdump.rs` writes the decoded pages out as PNGs

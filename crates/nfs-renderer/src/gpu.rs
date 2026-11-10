@@ -523,7 +523,9 @@ impl Core {
             label: Some("nfs-renderer"),
             // no optional feature for the game itself; the profiler adds the timestamp queries only when asked (never in `minimal`)
             required_features: if crate::prof::wanted() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
-            required_limits: wgpu::Limits::default(),
+            // WebGPU's defaults, lowered where this adapter offers less: the iOS simulator's Metal device, for one,
+            // has 15 inter-stage shader variables where the defaults ask for 16. A desktop GPU meets them all.
+            required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
             ..Default::default()
         }))
         .context("request device")?;

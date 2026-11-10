@@ -65,7 +65,11 @@ impl App {
     /// entirely, another Space, a hidden app) or minimised. A window that is only unfocused, or
     /// partly covered, is visible and not counted.
     pub(crate) fn window_hidden(&self) -> bool {
-        self.occluded || self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true))
+        // PLATFORM GLUE (iOS): a window there is never minimised, and winit logs a warning on every call
+        #[cfg(target_os = "ios")]
+        return self.occluded;
+        #[cfg(not(target_os = "ios"))]
+        return self.occluded || self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true));
     }
 
     /// **The front end's idle redraw.** `true` when this frame would put exactly the pixels on the

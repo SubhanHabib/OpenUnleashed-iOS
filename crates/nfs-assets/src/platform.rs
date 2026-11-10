@@ -22,7 +22,8 @@ pub fn data_dir() -> PathBuf {
     // PORT-DEVIATION D41 (RE/notes/PORT-DEVIATIONS.md): the saves live in the per-OS data folder, not in the
     // original's `.\SaveData\` (install.txt directory entry 48, `[0x65B360]`) under the game folder, and an
     // existing original profile is not imported.
-    if cfg!(target_os = "macos") {
+    // (iOS: `HOME` is the app's sandbox container, which has the same `Library/Application Support`)
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
         let base = home_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("Library").join("Application Support").join("PorscheUnleashed")
     } else if cfg!(windows) {
@@ -48,6 +49,11 @@ pub fn data_dir() -> PathBuf {
 /// `~/Games/NFS-Porsche-Unleashed[/game_info/data]`.
 pub fn game_data_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
+    // iOS: only the copy the app imported itself (`ios_game_dir`); the bundle is signed and holds no game file
+    if cfg!(target_os = "ios") {
+        v.extend(ios_game_dir());
+        return v;
+    }
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
         v.push(dir.join("game"));
         v.push(dir.join("../Resources/game"));
@@ -60,6 +66,17 @@ pub fn game_data_candidates() -> Vec<PathBuf> {
         v.push(home.join("Games/NFS-Porsche-Unleashed"));
     }
     v
+}
+
+/// iOS: where the app keeps the game data it imported (`<container>/Library/Application Support/game`, out of the
+/// Files app's view and of the device backup). `None` with no home.
+pub fn ios_game_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join("Library").join("Application Support").join("game"))
+}
+
+/// iOS: the app's `Documents` folder, the one the Files app and Finder show (`UIFileSharingEnabled`).
+pub fn documents_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join("Documents"))
 }
 
 /// The developer's install, for tests and examples (`$NFS5_GAME_PATH`, else the home fallbacks);
@@ -88,6 +105,10 @@ pub fn photo_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     let Some(home) = home_dir() else { return PathBuf::from("PorscheUnleashed") };
+    // iOS: `Documents/Photos`, so the Files app shows them
+    if cfg!(target_os = "ios") {
+        return home.join("Documents").join("Photos");
+    }
     let pictures = if cfg!(windows) {
         known_pictures().unwrap_or_else(|| home.join("Pictures"))
     } else if cfg!(target_os = "macos") {

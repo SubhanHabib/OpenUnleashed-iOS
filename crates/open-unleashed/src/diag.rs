@@ -19,6 +19,14 @@ static LOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// Where the log goes; `None` when no file is wanted.
 fn log_path() -> Option<PathBuf> {
+    // iOS: always, into `Documents/Logs`, where the Files app can reach it (there is no terminal on a device)
+    #[cfg(target_os = "ios")]
+    if let Some(dir) = nfs_assets::platform::documents_dir().map(|d| d.join("Logs")) {
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("open-unleashed.log");
+        let _ = std::fs::rename(&path, dir.join("open-unleashed.prev.log"));
+        return Some(path);
+    }
     let want = !cfg!(debug_assertions) || std::env::var_os("NFS_LOG_FILE").is_some_and(|v| v != "0");
     if !want || std::env::var_os("NFS_NO_LOG_FILE").is_some() {
         return None;
@@ -69,13 +77,20 @@ fn append(path: &PathBuf, text: &str) {
 
 /// Initialises tracing (stderr + the log file) and installs the panic hook. Call first in `main`.
 pub fn init() {
+    // PLATFORM GLUE (iOS): winit 0.30's UIKit loop warns on every pass ("processing non `RedrawRequested` event
+    // after the main event loop: AboutToWait"), a known quirk of its state machine with no effect on the events.
+    // Logged, it fills the log by hundreds of MB a minute and keeps the main thread writing instead of drawing.
+    #[cfg(target_os = "ios")]
+    const DEFAULT_FILTER: &str = "info,winit::platform_impl::ios::app_state=error";
+    #[cfg(not(target_os = "ios"))]
+    const DEFAULT_FILTER: &str = "info";
     let path = log_path();
     let _ = LOG.set(path.clone());
     let file = path.as_ref().and_then(|p| std::fs::File::create(p).ok());
     let tee = Tee(Arc::new(Mutex::new(file)));
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_FILTER.into()),
         )
         .with_ansi(false)
         .with_writer(tee)
@@ -169,7 +184,7 @@ fn message_box(text: &str) {
 }
 
 /// Linux and the other Unixes: the desktop's own dialog tool when one is installed (GNOME / KDE), else only the log and stderr.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn message_box(text: &str) {
     use std::process::Command;
     let title = crate::brand::TITLE;
@@ -178,3 +193,8 @@ fn message_box(text: &str) {
     }
     let _ = Command::new("kdialog").args(["--title", title, "--error", text]).status();
 }
+
+/// iOS: no box here; a start-up error is shown on the app's own data screen (`ios/importer.rs`), a panic ends the
+/// process and stays in `Documents/Logs`.
+#[cfg(target_os = "ios")]
+fn message_box(_text: &str) {}

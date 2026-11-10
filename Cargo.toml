@@ -50,7 +50,9 @@ pollster = "1"
 # gamepad / haptic side (with HIDAPI, power and sensors, which the gamepad code uses) — no audio, video, GPU,
 # render, camera, dialog or tray, so no window and no focus change.
 # Raw sdl3-sys (no `sdl3` wrapper): the input layer needs a dozen calls
-sdl3-sys = { version = "0.7", features = ["build-from-source-static", "debug-impls", "sdl-unix-console-build", "no-sdl-audio", "no-sdl-video", "no-sdl-gpu", "no-sdl-render", "no-sdl-camera", "no-sdl-dialog", "no-sdl-tray"] }
+# (`no-sdl-video` is added per target in `nfs-input`: SDL's iOS joystick driver (GameController) needs the UIKit
+# video glue compiled in, though the video subsystem is never initialised)
+sdl3-sys = { version = "0.7", features = ["build-from-source-static", "debug-impls", "sdl-unix-console-build", "no-sdl-audio", "no-sdl-gpu", "no-sdl-render", "no-sdl-camera", "no-sdl-dialog", "no-sdl-tray"] }
 cpal = "0.18"
 libm = "0.2"
 

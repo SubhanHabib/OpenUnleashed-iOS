@@ -148,6 +148,10 @@ impl Devices {
             // the MFi driver, whose rumble is CoreHaptics (four `CHHapticEngine`s, two
             // `sendParameters` a call) — late and smeared on an Xbox pad, where HIDAPI
             // writes the pad's own rumble report at once.
+            // iOS: SDL counts on its own `main` (SDL_main.h) to say the app has started; here winit owns
+            // `UIApplicationMain`, so say it directly
+            #[cfg(target_os = "ios")]
+            sdl3_sys::main::SDL_SetMainReady();
             if !SDL_Init(SUBSYSTEMS) {
                 return Err(sdl_error());
             }
@@ -751,6 +755,17 @@ pub struct PadAxisSet {
     pub values: [i32; 8],
 }
 
+/// **PLATFORM GLUE**: a host's change to what a pad reports, by the pad's name, before the bindings read it. The
+/// iOS app uses it for its on-screen pad's layout options (pedals on the face buttons, steering on the d-pad or
+/// the device's tilt). Not in the original, and unset on the desktop.
+pub type PadFilter = fn(&str, &mut PadSnapshot);
+static PAD_FILTER: std::sync::OnceLock<PadFilter> = std::sync::OnceLock::new();
+
+/// Sets the [`PadFilter`] (once; later calls are ignored).
+pub fn set_pad_filter(filter: PadFilter) {
+    let _ = PAD_FILTER.set(filter);
+}
+
 /// What a **standard pad** (an SDL gamepad with a mapping) reports, in SDL's units.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PadSnapshot {
@@ -870,6 +885,9 @@ impl Device {
             if let Some(sdl) = sdl_button(*b, &self.face) {
                 p.buttons[n] = button(sdl);
             }
+        }
+        if let Some(filter) = PAD_FILTER.get() {
+            filter(&self.name, &mut p);
         }
         Some(p)
     }

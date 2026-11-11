@@ -656,6 +656,39 @@ impl App {
         }
     }
 
+    /// **PLATFORM GLUE (iOS)**: the HUD's sprites in the lower right quarter (the speedometer, the rev counter, the
+    /// gear) moved left, together, just far enough to end `clear` logical pixels in from the right edge, clear of the
+    /// on-screen pedals. The rest of the HUD stays where it is.
+    fn clear_hud_corner(sprites: &mut [nfs_renderer::Sprite], (lw, lh): (u32, u32), clear: f32) {
+        let aspect = lw as f32 / lh.max(1) as f32;
+        let corner = |s: &nfs_renderer::Sprite| -> Option<(f32, f32)> {
+            let (x0, x1, y0, y1) = match &s.tri {
+                Some((p, _)) => p.iter().fold((f32::MAX, f32::MIN, f32::MAX, f32::MIN), |(a, b, c, d), q| {
+                    (a.min(q[0]), b.max(q[0]), c.min(q[1]), d.max(q[1]))
+                }),
+                None => (s.pos[0], s.pos[0] + s.size[0] / aspect, s.pos[1], s.pos[1] + s.size[1]),
+            };
+            ((x0 + x1) / 2.0 > 0.5 && (y0 + y1) / 2.0 > 0.5).then_some((x0, x1))
+        };
+        let edge = 1.0 - clear / lw.max(1) as f32;
+        let right = sprites.iter().filter_map(corner).map(|(_, x1)| x1).fold(f32::MIN, f32::max);
+        let dx = right - edge;
+        if dx <= 0.0 {
+            return;
+        }
+        for s in sprites.iter_mut() {
+            if corner(s).is_none() {
+                continue;
+            }
+            s.pos[0] -= dx;
+            if let Some((pts, _)) = s.tri.as_mut() {
+                for p in pts.iter_mut() {
+                    p[0] -= dx;
+                }
+            }
+        }
+    }
+
     /// **PLATFORM GLUE**: the render target at [`App::render_scale`] of the window's pixels, and the dll's mode
     /// cells to match (`camera::set_mode`).
     pub(crate) fn apply_render_size(&mut self) {
@@ -925,6 +958,9 @@ impl App {
         self.photo_hint();
         if let Some(safe) = safe {
             Self::shift_hud(&mut self.scene.sprites[hud_sprites_from..], (lw, lh), safe);
+        }
+        if self.vehicle.is_some() && self.shot_target.is_none() && self.hud_clear_right > 0.0 {
+            Self::clear_hud_corner(&mut self.scene.sprites[hud_sprites_from..], (lw, lh), self.hud_clear_right);
         }
         // `+0x100` for the next release, and sound 9 when the pointer crosses into a button
         // (0x41B3BA…0x41B3C6)

@@ -222,6 +222,9 @@ pub(crate) struct App {
     /// PLATFORM GLUE (iOS): the safe area's insets in logical pixels `[left, top, right, bottom]` (the camera
     /// cutout, the home indicator): the race HUD is laid out inside them ([`App::hud_safe`]); zero elsewhere
     pub(crate) hud_inset: [f32; 4],
+    /// PLATFORM GLUE (iOS): how far in from the right edge, in logical pixels, on-screen touch controls take up the
+    /// lower right; the race HUD's gauges there move left of them ([`App::clear_hud_corner`]); zero elsewhere
+    pub(crate) hud_clear_right: f32,
     /// PLATFORM GLUE: the render target's size as a fraction of the window's pixels (iOS's Resolution option;
     /// 1 elsewhere). The HUD's logical resolution stays the window's ([`App::hud_geometry`]).
     pub(crate) render_scale: f32,

@@ -313,23 +313,23 @@ impl Keyboard {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct CGPoint {
-    x: f64,
-    y: f64,
+pub(super) struct CGPoint {
+    pub(super) x: f64,
+    pub(super) y: f64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct CGSize {
-    width: f64,
-    height: f64,
+pub(super) struct CGSize {
+    pub(super) width: f64,
+    pub(super) height: f64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct CGRect {
-    origin: CGPoint,
-    size: CGSize,
+pub(super) struct CGRect {
+    pub(super) origin: CGPoint,
+    pub(super) size: CGSize,
 }
 
 #[repr(C)]
@@ -358,7 +358,7 @@ unsafe impl Encode for CGAffineTransform {
 }
 
 /// winit's view of the window.
-fn ui_view(window: &winit::window::Window) -> Option<Retained<UIView>> {
+pub(super) fn ui_view(window: &winit::window::Window) -> Option<Retained<UIView>> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let RawWindowHandle::UiKit(h) = window.window_handle().ok()?.as_raw() else { return None };
     // SAFETY: winit's live `UIView`, retained for our use
@@ -488,16 +488,23 @@ impl VirtualPad {
     /// Whether a pad other than the on-screen one is connected. `OPEN_UNLEASHED_TOUCH_PAD` set keeps the
     /// on-screen pad regardless (the simulator always reports a pad of its own).
     fn physical_pad(&self) -> bool {
-        if std::env::var_os("OPEN_UNLEASHED_TOUCH_PAD").is_some() {
-            return false;
-        }
-        let Some(cls) = AnyClass::get(c"GCController") else { return false };
-        // SAFETY: `+[GCController controllers]`, and `-[GCVirtualController controller]`
-        unsafe {
-            let list: Retained<NSArray<AnyObject>> = msg_send![cls, controllers];
-            let own: Option<Retained<AnyObject>> = self.vc.as_ref().and_then(|vc| msg_send![&**vc, controller]);
-            list.iter().any(|c| own.as_ref().is_none_or(|o| !std::ptr::eq(&*c, &**o)))
-        }
+        // SAFETY: `-[GCVirtualController controller]`
+        let own: Option<Retained<AnyObject>> = self.vc.as_ref().and_then(|vc| unsafe { msg_send![&**vc, controller] });
+        physical_pad(own.as_deref())
+    }
+}
+
+/// Whether a game controller other than `own` (Apple's on-screen pad's) is connected. `OPEN_UNLEASHED_TOUCH_PAD`
+/// set says none (the simulator always reports a pad of its own).
+pub(super) fn physical_pad(own: Option<&AnyObject>) -> bool {
+    if std::env::var_os("OPEN_UNLEASHED_TOUCH_PAD").is_some() {
+        return false;
+    }
+    let Some(cls) = AnyClass::get(c"GCController") else { return false };
+    // SAFETY: `+[GCController controllers]`
+    unsafe {
+        let list: Retained<NSArray<AnyObject>> = msg_send![cls, controllers];
+        list.iter().any(|c| own.is_none_or(|o| !std::ptr::eq(&*c, o)))
     }
 }
 

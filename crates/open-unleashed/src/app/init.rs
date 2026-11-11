@@ -240,6 +240,7 @@ impl App {
             hud_clock_base: 0.0,
             hud_scale: std::cell::Cell::new(1.0),
             hud_inset: [0.0; 4],
+            hud_clear_right: 0.0,
             render_scale: 1.0,
             surface_px: None,
             fps_cap: nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0),

@@ -51,6 +51,15 @@ pub enum Steering {
     Tilt,
 }
 
+/// Where the on-screen controls are: `Split` is the app's own (steering under the left thumb, the pedals and the
+/// gears under the right, `deck.rs`), `Gamepad` Apple's on-screen pad (`touch.rs`), which puts the stick and the
+/// triggers together on the left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    Split,
+    Gamepad,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pedals {
     Triggers,
@@ -59,6 +68,7 @@ pub enum Pedals {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TouchSettings {
+    pub layout: Layout,
     pub steering: Steering,
     pub pedals: Pedals,
     pub xy: bool,
@@ -70,7 +80,7 @@ pub struct TouchSettings {
 
 impl TouchSettings {
     pub const DEFAULT: Self =
-        Self { steering: Steering::Stick, pedals: Pedals::Triggers, xy: true, shoulders: true, right_stick: false, tilt_sensitivity: 1.0 };
+        Self { layout: Layout::Split, steering: Steering::Stick, pedals: Pedals::Triggers, xy: true, shoulders: true, right_stick: false, tilt_sensitivity: 1.0 };
 
     fn parse(text: &str) -> Self {
         let mut s = Self::DEFAULT;
@@ -87,6 +97,7 @@ impl TouchSettings {
                         _ => Steering::Stick,
                     }
                 }
+                "layout" => s.layout = if v == "gamepad" { Layout::Gamepad } else { Layout::Split },
                 "pedals" => s.pedals = if v == "buttons" { Pedals::Buttons } else { Pedals::Triggers },
                 "xy" => s.xy = on,
                 "shoulders" => s.shoulders = on,
@@ -113,8 +124,12 @@ impl TouchSettings {
             Pedals::Triggers => "triggers",
             Pedals::Buttons => "buttons",
         };
+        let layout = match self.layout {
+            Layout::Split => "split",
+            Layout::Gamepad => "gamepad",
+        };
         format!(
-            "steering={steering}\npedals={pedals}\nxy={}\nshoulders={}\nright_stick={}\ntilt_sensitivity={:.2}\n",
+            "layout={layout}\nsteering={steering}\npedals={pedals}\nxy={}\nshoulders={}\nright_stick={}\ntilt_sensitivity={:.2}\n",
             self.xy as u8, self.shoulders as u8, self.right_stick as u8, self.tilt_sensitivity
         )
     }
@@ -122,6 +137,22 @@ impl TouchSettings {
     /// What each button does with these settings, for the page.
     fn legend(&self) -> String {
         let mut parts = vec![];
+        if self.layout == Layout::Split {
+            parts.push(
+                match self.steering {
+                    Steering::Stick => "Left thumb: steer (the stick comes up where the thumb lands)",
+                    Steering::Touchpad => "Left thumb: steer (a fixed stick, read where the thumb is on it)",
+                    Steering::DPad => "Left thumb: the ◀ ▶ buttons steer",
+                    Steering::Tilt => "Tilt the device to steer",
+                }
+                .to_owned(),
+            );
+            parts.push("Right thumb: GAS, BRAKE (held: reverse), HAND (handbrake); slide between them".to_owned());
+            parts.push("▲ / ▼ above the pedals: shift up / down".to_owned());
+            parts.push("Small buttons: reset the car, change camera, look back".to_owned());
+            parts.push("Two-finger tap: pause · Three-finger tap: this page".to_owned());
+            return parts.join("\n");
+        }
         match self.pedals {
             Pedals::Triggers => {
                 parts.push("Right trigger: accelerate".to_owned());
@@ -288,6 +319,11 @@ static TILT: AtomicI32 = AtomicI32::new(0);
 
 pub fn current() -> TouchSettings {
     CURRENT.read().map(|s| *s).unwrap_or(TouchSettings::DEFAULT)
+}
+
+/// The device's tilt as a stick's X (−32767…32767), while tilt steering is on.
+pub fn tilt() -> i32 {
+    TILT.load(Ordering::Relaxed)
 }
 
 pub fn is_open() -> bool {
@@ -473,12 +509,16 @@ impl Tilt {
 
 const STEERING: [(&str, Steering); 4] =
     [("Stick", Steering::Stick), ("D-pad", Steering::DPad), ("Touchpad", Steering::Touchpad), ("Tilt", Steering::Tilt)];
+const LAYOUT: [(&str, Layout); 2] = [("Split (left steers, right drives)", Layout::Split), ("Gamepad", Layout::Gamepad)];
 const PEDALS: [(&str, Pedals); 2] = [("Triggers (analogue)", Pedals::Triggers), ("A / B buttons", Pedals::Buttons)];
 const RESOLUTION: [(&str, f32); 3] = [("Full", 1.0), ("75%", 0.75), ("50%", 0.5)];
 const FRAME_RATE: [(&str, u32); 3] = [("Unlimited", 0), ("60 fps", 60), ("30 fps", 30)];
 
 struct Controls {
     vc: Retained<UIViewController>,
+    layout: Retained<UISegmentedControl>,
+    /// the rows that are only Apple's pad's (`Layout::Gamepad`)
+    gamepad_only: Vec<Retained<UIView>>,
     steering: Retained<UISegmentedControl>,
     pedals: Retained<UISegmentedControl>,
     xy: Retained<UISwitch>,
@@ -796,6 +836,7 @@ impl Page {
             haptics: c.haptics.isOn(),
         };
         let s = TouchSettings {
+            layout: LAYOUT.get(pick(&c.layout)).map_or(Layout::Split, |l| l.1),
             steering: STEERING.get(pick(&c.steering)).map_or(Steering::Stick, |s| s.1),
             pedals: PEDALS.get(pick(&c.pedals)).map_or(Pedals::Triggers, |p| p.1),
             xy: c.xy.isOn(),
@@ -812,6 +853,9 @@ impl Page {
         if let Some(c) = self.ivars().controls.borrow().as_ref() {
             c.legend.setText(Some(&NSString::from_str(&s.legend())));
             c.tilt_row.setHidden(s.steering != Steering::Tilt);
+            for v in &c.gamepad_only {
+                v.setHidden(s.layout != Layout::Gamepad);
+            }
         }
     }
 }
@@ -905,11 +949,13 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let touch_h = label(mtm, "Touch controls", UIFont::boldSystemFontOfSize(21.0), 1.0);
     let note = label(
         mtm,
-        "The on-screen controller appears in a race when no game controller is connected.",
+        "The on-screen controls appear in a race when no game controller is connected.",
         UIFont::systemFontOfSize(14.0),
         0.65,
     );
 
+    let layout_l = label(mtm, "Layout", UIFont::boldSystemFontOfSize(15.0), 0.75);
+    let layout = segments(mtm, page, &LAYOUT.map(|l| l.0), LAYOUT.iter().position(|x| x.1 == s.layout).unwrap_or(0));
     let steering_l = label(mtm, "Steering", UIFont::boldSystemFontOfSize(15.0), 0.75);
     let steering = segments(mtm, page, &STEERING.map(|s| s.0), STEERING.iter().position(|x| x.1 == s.steering).unwrap_or(0));
     let pedals_l = label(mtm, "Accelerator and brake", UIFont::boldSystemFontOfSize(15.0), 0.75);
@@ -991,8 +1037,8 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     // SAFETY: as in `segments`
     unsafe { done.addTarget_action_forControlEvents(Some(page), sel!(done:), UIControlEvents::TouchUpInside) };
 
-    let views: [&UIView; 40] = [
-        &title, &touch_h, &note, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
+    let views: [&UIView; 42] = [
+        &title, &touch_h, &note, &layout_l, &layout, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
         &legend, &display_h, &resolution_l, &resolution, &frame_rate_l, &frame_rate, &safe_row, &fog_row, &filter_row, &game_h,
         &movies_row, &col_row, &haptics_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &pack_button,
         &pack_status, &saves_h, &saves_note,
@@ -1001,6 +1047,7 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let content = stack(mtm, &views, UILayoutConstraintAxis::Vertical, 12.0);
     content.setAlignment(UIStackViewAlignment::Fill);
     content.setCustomSpacing_afterView(20.0, &note);
+    content.setCustomSpacing_afterView(20.0, &layout);
     content.setCustomSpacing_afterView(20.0, &tilt_row);
     content.setCustomSpacing_afterView(20.0, &pedals);
     content.setCustomSpacing_afterView(20.0, &rs_row);
@@ -1038,8 +1085,15 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
         c.setActive(true);
     }
 
+    let gamepad_only: Vec<Retained<UIView>> =
+        [Retained::into_super(pedals_l.clone()), Retained::into_super(Retained::into_super(pedals.clone())),
+            Retained::into_super(extra_l.clone()), Retained::into_super(xy_row.clone()),
+            Retained::into_super(sh_row.clone()), Retained::into_super(rs_row.clone())]
+        .into();
     Controls {
         vc,
+        layout,
+        gamepad_only,
         steering,
         pedals,
         xy,
@@ -1083,7 +1137,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let s = TouchSettings { steering: Steering::Tilt, pedals: Pedals::Buttons, xy: false, shoulders: true, right_stick: true, tilt_sensitivity: 1.5 };
+        let s = TouchSettings { layout: Layout::Gamepad, steering: Steering::Tilt, pedals: Pedals::Buttons, xy: false, shoulders: true, right_stick: true, tilt_sensitivity: 1.5 };
         assert_eq!(TouchSettings::parse(&s.text()), s);
         assert_eq!(TouchSettings::parse(""), TouchSettings::DEFAULT);
         let o = GameOptions { safe_hud: false, resolution: 0.75, fps_cap: 30, fog: false, filtering: false, skip_movies: true,

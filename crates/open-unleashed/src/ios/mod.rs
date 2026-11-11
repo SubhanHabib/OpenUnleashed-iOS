@@ -15,6 +15,7 @@
 //!   in a race when no physical pad is connected; its layout is set on the touch-controls page (`settings.rs`).
 
 mod backup;
+mod deck;
 mod haptics;
 mod importer;
 pub(crate) mod settings;
@@ -38,6 +39,7 @@ pub fn run() -> Result<()> {
         state: State::Booting,
         touch: touch::Touch::default(),
         pad: touch::VirtualPad::default(),
+        deck: deck::Deck::default(),
         keyboard: touch::Keyboard::default(),
         tilt: settings::Tilt::default(),
         glue_settings_done: false,
@@ -57,6 +59,8 @@ struct Root {
     state: State,
     touch: touch::Touch,
     pad: touch::VirtualPad,
+    /// the split on-screen controls (`settings::Layout::Split`)
+    deck: deck::Deck,
     keyboard: touch::Keyboard,
     tilt: settings::Tilt,
     glue_settings_done: bool,
@@ -265,6 +269,7 @@ impl ApplicationHandler for Root {
                 settings::poll();
                 if settings::take_changed() {
                     self.pad.rebuild();
+                    self.deck.rebuild();
                 }
                 if settings::take_options_changed() {
                     Self::apply_options(app);
@@ -274,8 +279,18 @@ impl ApplicationHandler for Root {
                     Some(w) if settings::options().safe_hud => safe_insets(w),
                     _ => [0.0; 4],
                 };
-                self.pad.update(app);
-                self.tilt.update(self.pad.connected() && settings::current().steering == settings::Steering::Tilt);
+                let split = settings::current().layout == settings::Layout::Split;
+                self.deck.update(app, split);
+                // the gauges move left of the on-screen pedals
+                app.hud_clear_right = self.deck.clear_right().unwrap_or(0.0) as f32;
+                if split {
+                    // Apple's pad off
+                    self.pad.rebuild();
+                } else {
+                    self.pad.update(app);
+                }
+                let touch_on = self.pad.connected() || self.deck.shown();
+                self.tilt.update(touch_on && settings::current().steering == settings::Steering::Tilt);
                 if self.touch.take_pressed() {
                     self.keyboard.touched(app);
                 }

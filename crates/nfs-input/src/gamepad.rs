@@ -88,6 +88,8 @@ pub struct Gamepads {
     ff_hotplug: bool,
     /// set by [`Gamepads::poll`] when any device was connected; taken by [`Gamepads::take_pad_hotplug`]
     pad_hotplug: bool,
+    /// the host pad ([`set_host_pad`]) was on at the last poll
+    host_on: bool,
 }
 
 /// The last SDL error, for the log.
@@ -432,7 +434,7 @@ impl Gamepads {
                 None
             }
         };
-        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
+        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false, host_on: false }
     }
 
     /// Whether a device that can rumble or has SDL haptic effects was connected since the last call
@@ -585,6 +587,12 @@ impl Gamepads {
     /// the left stick steering for a control no binding read) is gone; only the front end's
     /// navigation keys stay the port's own (PORT-DEVIATION D10).
     pub fn poll(&mut self, input: &mut InputState) {
+        let host_on = host_pad().is_some();
+        if host_on != self.host_on {
+            tracing::info!(on = host_on, "host pad");
+            self.host_on = host_on;
+            self.pad_hotplug |= host_on;
+        }
         let Some(d) = self.devices.as_mut() else { return };
         let mut ev = SDL_Event::default();
         // SAFETY: SDL_PollEvent fills `ev`; each arm reads the union member its type names
@@ -790,6 +798,42 @@ pub fn set_pad_filter(filter: PadFilter) {
     let _ = PAD_FILTER.set(filter);
 }
 
+/// **PLATFORM GLUE**: the name the host's own on-screen controls have in the device list ([`set_host_pad`]).
+pub const HOST_PAD_NAME: &str = "Open Unleashed Touch";
+static HOST_PAD: std::sync::Mutex<Option<PadSnapshot>> = std::sync::Mutex::new(None);
+
+/// **PLATFORM GLUE**: the host's own on-screen controls (the iOS app's split touch layout) as a standard pad:
+/// `Some` is what they report from now on, `None` takes them away. They are read with the first standard pad
+/// when one is connected (one record, so the bindings that pad has drive the car), else as a standard pad of
+/// their own at the end of the device list. The pad filter is not applied to them. Not in the original.
+pub fn set_host_pad(p: Option<PadSnapshot>) {
+    if let Ok(mut h) = HOST_PAD.lock() {
+        *h = p;
+    }
+}
+
+fn host_pad() -> Option<PadSnapshot> {
+    HOST_PAD.lock().ok().and_then(|h| *h)
+}
+
+/// `host` read into `into`: each axis is the one further from its rest, each button pressed on either, the
+/// hat the host's when it is off centre.
+fn merge_record(into: &mut PadRecord, host: &PadRecord) {
+    // a stick's rest is the axis's middle, a trigger's too (`trigger_value`)
+    let off = |v: i32| (v - 0x8000).abs();
+    for n in 0..6 {
+        if off(host.axes[n]) > off(into.axes[n]) {
+            into.axes[n] = host.axes[n];
+        }
+    }
+    for n in 0..into.buttons.len() {
+        into.buttons[n] |= host.buttons[n];
+    }
+    if host.pov[0] != hat_of(false, false, false, false) {
+        into.pov[0] = host.pov[0];
+    }
+}
+
 /// What a **standard pad** (an SDL gamepad with a mapping) reports, in SDL's units.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PadSnapshot {
@@ -968,8 +1012,16 @@ impl Gamepads {
     /// only game devices (pads, wheels, sticks, pedals), so here every device is a pad and the two
     /// lists come out the same.
     pub fn devices(&self) -> Vec<(String, bool)> {
-        let Some(d) = self.devices.as_ref() else { return Vec::new() };
-        d.list.iter().map(|x| (x.name.clone(), true)).collect()
+        let mut out: Vec<(String, bool)> = self.devices.as_ref().map_or(Vec::new(), |d| d.list.iter().map(|x| (x.name.clone(), true)).collect());
+        if self.host_alone() {
+            out.push((HOST_PAD_NAME.to_owned(), true));
+        }
+        out
+    }
+
+    /// The host pad is on and no standard pad is connected: it is a device of its own.
+    fn host_alone(&self) -> bool {
+        host_pad().is_some() && !self.devices.as_ref().is_some_and(|d| d.list.iter().any(|x| !x.pad.is_null()))
     }
 
     /// Every device's reading as the original's device record (`bindings::PadRecord`): see
@@ -987,8 +1039,16 @@ impl Gamepads {
     /// buffer).
     pub fn records_into(&self, out: &mut Vec<PadRecord>) {
         out.clear();
-        let Some(d) = self.devices.as_ref() else { return };
-        out.extend(d.list.iter().map(Device::record));
+        if let Some(d) = self.devices.as_ref() {
+            out.extend(d.list.iter().map(Device::record));
+        }
+        if let Some(p) = host_pad() {
+            let r = pad_record(&p);
+            match out.iter().position(|x| x.standard) {
+                Some(i) => merge_record(&mut out[i], &r),
+                None => out.push(r),
+            }
+        }
     }
 
     /// The connected devices' axis sets, in connection order — what `NFS5.DEADZONE` draws from.
@@ -999,14 +1059,7 @@ impl Gamepads {
     /// Y **+1** (0x51D60A…0x51D6EB), which is stick forward to accelerate only with a Y that grows
     /// downward — SDL's does, as DirectInput's.
     pub fn axis_sets(&self) -> Vec<PadAxisSet> {
-        let Some(d) = self.devices.as_ref() else { return Vec::new() };
-        d.list
-            .iter()
-            .map(|x| {
-                let r = x.record();
-                PadAxisSet { mask: r.mask, values: r.axes.map(|v| v.clamp(0, 0xFFFF)) }
-            })
-            .collect()
+        self.records().iter().map(|r| PadAxisSet { mask: r.mask, values: r.axes.map(|v| v.clamp(0, 0xFFFF)) }).collect()
     }
 }
 
@@ -1201,6 +1254,23 @@ mod tests {
 
     /// The port's 15 buttons on SDL3's gamepad buttons (SDL2's `A B Y X LB RB Back Start Guide LS RS`),
     /// the four placeholder slots on none.
+    #[test]
+    fn the_host_pad_reads_with_the_first_standard_pad() {
+        let rest = pad_record(&PadSnapshot::default());
+        let mut host = PadSnapshot::default();
+        host.sticks[0] = -32767;
+        host.triggers[1] = 32767;
+        host.buttons[7] = true;
+        let mut r = rest.clone();
+        r.buttons[0] = true;
+        merge_record(&mut r, &pad_record(&host));
+        assert_eq!(r.axes[0], 1);
+        assert_eq!(r.axes[5], 0x8000 + 32767);
+        assert_eq!(r.axes[2], rest.axes[2]);
+        assert!(r.buttons[0] && r.buttons[7]);
+        assert_eq!(r.pov[0], rest.pov[0]);
+    }
+
     #[test]
     fn the_port_buttons_on_sdl3() {
         let f = DEFAULT_FACE;

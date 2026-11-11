@@ -282,7 +282,10 @@ impl ApplicationHandler for Root {
                 let split = settings::current().layout == settings::Layout::Split;
                 self.deck.update(app, split);
                 // the gauges move left of the on-screen pedals
-                app.hud_clear_right = self.deck.clear_right().unwrap_or(0.0) as f32;
+                app.hud_clear_right = match self.deck.clear_right() {
+                    Some(r) if settings::current().gauges_aside => r as f32,
+                    _ => 0.0,
+                };
                 if split {
                     // Apple's pad off
                     self.pad.rebuild();

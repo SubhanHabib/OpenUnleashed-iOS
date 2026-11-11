@@ -76,11 +76,14 @@ pub struct TouchSettings {
     pub right_stick: bool,
     /// Tilt steering's sensitivity, 0.5…2 (1: full lock at [`TILT_LOCK_DEG`] of tilt).
     pub tilt_sensitivity: f32,
+    /// The split layout: the race HUD's speedometer and rev counter move left of the buttons (`App::hud_clear_right`)
+    /// instead of staying under them.
+    pub gauges_aside: bool,
 }
 
 impl TouchSettings {
     pub const DEFAULT: Self =
-        Self { layout: Layout::Split, steering: Steering::Stick, pedals: Pedals::Triggers, xy: true, shoulders: true, right_stick: false, tilt_sensitivity: 1.0 };
+        Self { layout: Layout::Split, steering: Steering::Stick, pedals: Pedals::Triggers, xy: true, shoulders: true, right_stick: false, tilt_sensitivity: 1.0, gauges_aside: true };
 
     fn parse(text: &str) -> Self {
         let mut s = Self::DEFAULT;
@@ -102,6 +105,7 @@ impl TouchSettings {
                 "xy" => s.xy = on,
                 "shoulders" => s.shoulders = on,
                 "right_stick" => s.right_stick = on,
+                "gauges_aside" => s.gauges_aside = on,
                 "tilt_sensitivity" => {
                     if let Ok(f) = v.parse::<f32>() {
                         s.tilt_sensitivity = f.clamp(0.5, 2.0);
@@ -129,8 +133,8 @@ impl TouchSettings {
             Layout::Gamepad => "gamepad",
         };
         format!(
-            "layout={layout}\nsteering={steering}\npedals={pedals}\nxy={}\nshoulders={}\nright_stick={}\ntilt_sensitivity={:.2}\n",
-            self.xy as u8, self.shoulders as u8, self.right_stick as u8, self.tilt_sensitivity
+            "layout={layout}\nsteering={steering}\npedals={pedals}\nxy={}\nshoulders={}\nright_stick={}\ntilt_sensitivity={:.2}\ngauges_aside={}\n",
+            self.xy as u8, self.shoulders as u8, self.right_stick as u8, self.tilt_sensitivity, self.gauges_aside as u8
         )
     }
 
@@ -519,6 +523,9 @@ struct Controls {
     layout: Retained<UISegmentedControl>,
     /// the rows that are only Apple's pad's (`Layout::Gamepad`)
     gamepad_only: Vec<Retained<UIView>>,
+    gauges: Retained<UISwitch>,
+    /// the rows that are only the split layout's
+    split_only: Vec<Retained<UIView>>,
     steering: Retained<UISegmentedControl>,
     pedals: Retained<UISegmentedControl>,
     xy: Retained<UISwitch>,
@@ -844,6 +851,7 @@ impl Page {
             right_stick: c.right_stick.isOn(),
             // in steps of 0.05
             tilt_sensitivity: (c.tilt.value() * 20.0).round() / 20.0,
+            gauges_aside: c.gauges.isOn(),
         };
         Some((s, o))
     }
@@ -855,6 +863,9 @@ impl Page {
             c.tilt_row.setHidden(s.steering != Steering::Tilt);
             for v in &c.gamepad_only {
                 v.setHidden(s.layout != Layout::Gamepad);
+            }
+            for v in &c.split_only {
+                v.setHidden(s.layout != Layout::Split);
             }
         }
     }
@@ -956,6 +967,7 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
 
     let layout_l = label(mtm, "Layout", UIFont::boldSystemFontOfSize(15.0), 0.75);
     let layout = segments(mtm, page, &LAYOUT.map(|l| l.0), LAYOUT.iter().position(|x| x.1 == s.layout).unwrap_or(0));
+    let (gauges_row, gauges) = switch_row(mtm, page, "Move the speedometer out from under the buttons", s.gauges_aside);
     let steering_l = label(mtm, "Steering", UIFont::boldSystemFontOfSize(15.0), 0.75);
     let steering = segments(mtm, page, &STEERING.map(|s| s.0), STEERING.iter().position(|x| x.1 == s.steering).unwrap_or(0));
     let pedals_l = label(mtm, "Accelerator and brake", UIFont::boldSystemFontOfSize(15.0), 0.75);
@@ -1037,8 +1049,8 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     // SAFETY: as in `segments`
     unsafe { done.addTarget_action_forControlEvents(Some(page), sel!(done:), UIControlEvents::TouchUpInside) };
 
-    let views: [&UIView; 42] = [
-        &title, &touch_h, &note, &layout_l, &layout, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
+    let views: [&UIView; 43] = [
+        &title, &touch_h, &note, &layout_l, &layout, &gauges_row, &steering_l, &steering, &tilt_row, &pedals_l, &pedals, &extra_l, &xy_row, &sh_row, &rs_row, &legend_l,
         &legend, &display_h, &resolution_l, &resolution, &frame_rate_l, &frame_rate, &safe_row, &fog_row, &filter_row, &game_h,
         &movies_row, &col_row, &haptics_row, &tex_h, &packs_row, &enhance_row, &aniso_row, &dump_row, &tex_note, &pack_button,
         &pack_status, &saves_h, &saves_note,
@@ -1047,7 +1059,7 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
     let content = stack(mtm, &views, UILayoutConstraintAxis::Vertical, 12.0);
     content.setAlignment(UIStackViewAlignment::Fill);
     content.setCustomSpacing_afterView(20.0, &note);
-    content.setCustomSpacing_afterView(20.0, &layout);
+    content.setCustomSpacing_afterView(20.0, &gauges_row);
     content.setCustomSpacing_afterView(20.0, &tilt_row);
     content.setCustomSpacing_afterView(20.0, &pedals);
     content.setCustomSpacing_afterView(20.0, &rs_row);
@@ -1090,10 +1102,13 @@ fn build(mtm: MainThreadMarker, page: &Page, s: TouchSettings) -> Controls {
             Retained::into_super(extra_l.clone()), Retained::into_super(xy_row.clone()),
             Retained::into_super(sh_row.clone()), Retained::into_super(rs_row.clone())]
         .into();
+    let split_only: Vec<Retained<UIView>> = vec![Retained::into_super(gauges_row.clone())];
     Controls {
         vc,
         layout,
         gamepad_only,
+        gauges,
+        split_only,
         steering,
         pedals,
         xy,
@@ -1137,7 +1152,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let s = TouchSettings { layout: Layout::Gamepad, steering: Steering::Tilt, pedals: Pedals::Buttons, xy: false, shoulders: true, right_stick: true, tilt_sensitivity: 1.5 };
+        let s = TouchSettings { layout: Layout::Gamepad, steering: Steering::Tilt, pedals: Pedals::Buttons, xy: false, shoulders: true, right_stick: true, tilt_sensitivity: 1.5, gauges_aside: false };
         assert_eq!(TouchSettings::parse(&s.text()), s);
         assert_eq!(TouchSettings::parse(""), TouchSettings::DEFAULT);
         let o = GameOptions { safe_hud: false, resolution: 0.75, fps_cap: 30, fog: false, filtering: false, skip_movies: true,
